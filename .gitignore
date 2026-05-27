@@ -3,10 +3,11 @@
 *.parquet
 outputs/
 multirun/
-environments/
 figures/
 wandb/
 .slurm_logs/
+
+.claude
 
 # General
 .DS_Store

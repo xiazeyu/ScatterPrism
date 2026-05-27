@@ -1,11 +1,11 @@
-# MC-POM detector: medium
-# Medium momentum smearing (σ=0.5) + medium cos(θ) cut (0.8)
+# MC-POM detector — medium:
+#   momentum smearing (σ = 0.5) + cos(θ) acceptance cut at 0.8.
 
 defaults:
   - compose
 
 detectors:
-  - _target_: jetprism.detectors.MomentumSmearing
+  - _target_: scatterprism.detectors.MomentumSmearing
     sigma: 0.5
-  - _target_: jetprism.detectors.CosThetaCut
+  - _target_: scatterprism.detectors.CosThetaCut
     threshold: 0.8

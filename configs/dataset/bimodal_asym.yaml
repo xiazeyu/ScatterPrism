@@ -1,9 +1,10 @@
-# Asymmetric bimodal — tests ability to capture a minority mode
+# Asymmetric bimodal Gaussian: dominant mode (85%) + minority mode (15%).
+# Tests mode coverage — the model must not collapse onto the dominant mode.
 
 defaults:
   - multipeak
 
-# (mean, std, weight)
-peaks: [[-1.0, 0.4, 0.85], [3.0, 0.3, 0.15]]
-
-# dominant peak vs small minority peak. Model must not mode-collapse.
+# [mean, std, weight]
+peaks:
+  - [-1.0, 0.4, 0.85]
+  - [ 3.0, 0.3, 0.15]

@@ -1,10 +1,13 @@
+# Default MC-POM transform: 4-particle representation, redundant-channel
+# reduction, then standard scaling (auto-fitted mean/std, scale-factor 5).
+
 defaults:
   - compose
 
 transforms:
-  - _target_: jetprism.transforms.FourParticleRepresentation
-  - _target_: jetprism.transforms.ReduceRedundantv1
-  - _target_: jetprism.transforms.StandardScaler
+  - _target_: scatterprism.transforms.FourParticleRepresentation
+  - _target_: scatterprism.transforms.ReduceRedundantv1
+  - _target_: scatterprism.transforms.StandardScaler
     mean: null
     std: null
     scale: 5.0

@@ -1,29 +1,43 @@
+"""Detector effects applied to particle-level events.
+
+Each detector implements :class:`BaseDetector` and operates on a pandas
+``DataFrame`` of MC-POM events.  Detectors can be composed via
+:class:`Compose`, instantiated from Hydra configs, and chained inside
+:class:`~scatterprism.datasets.BaseDataset` to produce the ``detector_data``
+half of paired training samples.
+"""
+
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass
-from hepunits.units import MeV, GeV
-from omegaconf import MISSING, DictConfig
-from hydra.utils import instantiate
-from jetprism import kinematic
-from jetprism.schemas import EventNumpy
-from particle.literals import photon, proton, pi_plus, pi_minus
 import logging
+
+from hepunits.units import MeV, GeV
+from hydra.utils import instantiate
+from omegaconf import MISSING, DictConfig
+from particle.literals import photon, proton, pi_plus, pi_minus
 import numpy as np
 import pandas as pd
 import vector
+
+from scatterprism import kinematic
+from scatterprism.schemas import EventNumpy
 
 log = logging.getLogger(__name__)
 
 
 @dataclass
 class BaseDetector(metaclass=ABCMeta):
+    """Abstract base class for detector effects on event DataFrames."""
+
     @abstractmethod
     def apply(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Apply the detector to the given data."""
+        """Apply the detector to *data* and return the modified DataFrame."""
         raise NotImplementedError
 
 
 @dataclass
 class Compose(BaseDetector):
+    """Apply a sequence of :class:`BaseDetector` instances in order."""
 
     detectors: list[BaseDetector]
 
@@ -99,7 +113,14 @@ class ValueCut(BaseDetector):
 
 @dataclass
 class MomentumSmearing(BaseDetector):
-    """Detector that applies Gaussian smearing to momentum components."""
+    """Gaussian smearing of the π± momentum components ``k1{1,2,3}``, ``k2{1,2,3}``.
+
+    Each smeared component receives noise ``N(0, |p|² · sigma)`` (proportional
+    to the squared momentum, mimicking ATLAS-style resolution growth). ``p2``
+    is recomputed from momentum conservation so the event remains physical;
+    the derived observables (``t``, ``mpipi``, ``costh``, ``phi``) are then
+    refreshed from the new four-vectors.
+    """
 
     sigma: float = MISSING
     random_seed: int | None = None
@@ -179,32 +200,36 @@ class MomentumSmearing(BaseDetector):
 
 @dataclass
 class GeneralSmearing(BaseDetector):
-    """Detector that applies Gaussian smearing to all numeric columns."""
+    """Per-column Gaussian smearing with noise scale ``|value| · sigma``.
+
+    Applied independently to every numeric column. Unlike
+    :class:`MomentumSmearing`, this does not preserve event-level
+    conservation laws — it is a coarse, broadband corruption useful for
+    sanity-checking unfolding pipelines.
+    """
 
     sigma: float = MISSING
     random_seed: int | None = None
 
     def apply(self, data: pd.DataFrame) -> pd.DataFrame:
         rng = np.random.default_rng(self.random_seed)
-        # Select only numeric columns to apply smearing
         numeric_cols = data.select_dtypes(include=[np.number]).columns
-
-        # Create a copy of the data to avoid modifying the original dataframe
         smeared_data = data.copy()
-
         for col in numeric_cols:
             noise = rng.normal(
-                loc=0.0,
-                scale=np.abs(data[col]) * self.sigma,
-                size=len(data)
+                loc=0.0, scale=np.abs(data[col]) * self.sigma, size=len(data),
             )
             smeared_data[col] = data[col] + noise
-
         return smeared_data
 
 
 @dataclass
 class UniformPhi(BaseDetector):
+    """Resample so the azimuthal angle ``phi`` becomes uniform in ``[0, 2π)``.
+
+    Bins ``phi`` into ``num_bins`` equal-width bins and down-samples every
+    bin to the minimum population, yielding a φ-flat acceptance profile.
+    """
 
     num_bins: int = MISSING
     random_state: int | None = MISSING

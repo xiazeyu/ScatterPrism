@@ -1,4 +1,4 @@
-# Exponential (scale=1) — skewed, one-sided distribution
+# Exponential(scale=1) — skewed, one-sided distribution.
 
 defaults:
   - exponential

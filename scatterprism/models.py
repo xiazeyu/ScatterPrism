@@ -1,32 +1,63 @@
-"""
-Generative Models for JetPrism using PyTorch Lightning.
+"""Generative models for ScatterPrism using PyTorch Lightning.
 
 Includes:
-- DDPM: Denoising Diffusion Probabilistic Model
-- CFM: Conditional Flow Matching
+    * :class:`CFM`  — (Conditional) Flow Matching with torchdyn ODE solvers.
+      Used for both unconditional generation and detector unfolding.
+    * :class:`DDPM` — Denoising Diffusion Probabilistic Model (experimental
+      baseline; retained for comparison and future work).
 """
 
 import logging
-from typing import Union, List
 
+import lightning.pytorch as pl
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import lightning.pytorch as pl
+import wandb
+from scipy.stats import ks_2samp as scipy_ks_2samp
+from scipy.stats import wasserstein_distance as scipy_wasserstein
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
-
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from torchdyn.core import NeuralODE
 
-from jetprism.networks import (
-    FlowMatchingMLP, 
-    FlowMatchingResNet, 
-    DiffusionMLP,
+from scatterprism.metric import (
+    chi2_metric,
+    correlation_matrix_distance,
+    covariance_frobenius_distance,
+    pairwise_chi2_2d,
+)
+from scatterprism.networks import (
     ConditionalFlowMatchingMLP,
     ConditionalFlowMatchingResNet,
+    DiffusionMLP,
+    FlowMatchingMLP,
+    FlowMatchingResNet,
 )
 
 log = logging.getLogger(__name__)
+
+
+# Valid DDPM training targets; validated in DDPM.__init__ so an invalid value
+# fails at construction time rather than during the first sampling call.
+_DDPM_PREDICTION_TYPES = ("epsilon", "x0", "v")
+
+
+class _NFECounter(nn.Module):
+    """Wraps a velocity net to count the number of forward evaluations.
+
+    Used during validation to log NFE alongside distribution metrics for ODE
+    solvers (Flow Matching).
+    """
+
+    def __init__(self, net: nn.Module):
+        super().__init__()
+        self._inner = net
+        self.count = 0
+
+    def forward(self, *args, **kwargs):
+        self.count += 1
+        return self._inner(*args, **kwargs)
 
 
 # =============================================================================
@@ -178,7 +209,6 @@ class BaseGenerativeModel(pl.LightningModule):
     def on_fit_start(self):
         """Register epoch-level WandB metrics to use epoch (not global_step) as x-axis."""
         try:
-            import wandb
             if wandb.run is not None:
                 wandb.define_metric("epoch")
                 for metric in [
@@ -194,8 +224,8 @@ class BaseGenerativeModel(pl.LightningModule):
                     "val/nfe",
                 ]:
                     wandb.define_metric(metric, step_metric="epoch")
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"WandB metric definition skipped: {e}")
 
     def configure_optimizers(self):
         optimizer = AdamW(
@@ -267,16 +297,11 @@ class BaseGenerativeModel(pl.LightningModule):
         self._val_source_buffer.clear()
     
     def _compute_and_log_distribution_metrics(self) -> None:
-        """Generate samples and compute per-feature chi2, KS, and Wasserstein metrics.
-        
-        For paired/denoise mode: uses reconstruct(source_data) to evaluate reconstruction quality.
-        For generation mode: uses sample() to evaluate generation quality.
-        """
-        import numpy as np
-        from scipy.stats import ks_2samp as scipy_ks_2samp
-        from scipy.stats import wasserstein_distance as scipy_wasserstein
-        from jetprism.metric import chi2_metric
+        """Generate samples and log per-feature chi2 / KS / Wasserstein metrics.
 
+        Paired (denoise) mode reconstructs from source data; generation mode
+        samples from noise.
+        """
         # Concatenate buffered validation data on CPU
         val_data = torch.cat(self._val_data_buffer, dim=0)
         n = min(len(val_data), self.metric_sample_size)
@@ -287,17 +312,9 @@ class BaseGenerativeModel(pl.LightningModule):
         if has_source_data:
             source_data = torch.cat(self._val_source_buffer, dim=0)[:n]
 
-        # Generate samples in eval mode (temporarily switch back after)
-        # Wrap self.net (if present) with an NFE counter to measure ODE function evaluations
-        class _NFECounter(torch.nn.Module):
-            def __init__(self, net):
-                super().__init__()
-                self._inner = net
-                self.count = 0
-            def forward(self, *args, **kwargs):
-                self.count += 1
-                return self._inner(*args, **kwargs)
-
+        # Generate samples in eval mode (temporarily switch back after).
+        # Wrap self.net (if present) with an NFE counter to measure ODE function
+        # evaluations during sampling.
         nfe_counter = None
         original_net = None
         if hasattr(self, 'net'):
@@ -346,12 +363,9 @@ class BaseGenerativeModel(pl.LightningModule):
                     self.solver = original_solver
         except Exception as e:
             log.warning(f"Skipping distribution metrics — sample/reconstruct failed: {e}")
-            if was_training:
-                self.train()
-            if original_net is not None:
-                self.net = original_net
             return
         finally:
+            # Always restore training mode and the original net wrapper.
             if was_training:
                 self.train()
             if original_net is not None:
@@ -393,7 +407,6 @@ class BaseGenerativeModel(pl.LightningModule):
         # Joint distribution metrics (correlation structure across all channels)
         if num_features > 1:
             try:
-                from jetprism.metric import correlation_matrix_distance, covariance_frobenius_distance, pairwise_chi2_2d
                 corr_dist = correlation_matrix_distance(val_data, samples)
                 cov_dist = covariance_frobenius_distance(val_data, samples)
                 chi2_2d_results = pairwise_chi2_2d(val_data, samples)
@@ -410,12 +423,21 @@ class BaseGenerativeModel(pl.LightningModule):
                 log.debug(f"Joint distribution metrics failed: {e}")
 
     @torch.no_grad()
-    def sample(self, n_generate: int, device: torch.device | None = None) -> torch.Tensor:
+    def sample(
+        self,
+        n_generate: int,
+        device: torch.device | None = None,
+        cond: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Generate samples from the model. Override in subclasses."""
         raise NotImplementedError
-    
+
     @torch.no_grad()
-    def reconstruct(self, x0: torch.Tensor) -> torch.Tensor:
+    def reconstruct(
+        self,
+        x0: torch.Tensor,
+        cond: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Reconstruct from source distribution. Override in subclasses."""
         raise NotImplementedError
 
@@ -437,7 +459,7 @@ class DDPM(BaseGenerativeModel):
     def __init__(
         self,
         data_dim: int,
-        hidden_dims: Union[List[int], int] = 256,
+        hidden_dims: list[int] | int = 256,
         time_embed_dim: int = 64,
         num_timesteps: int = 1000,
         beta_start: float = 1e-4,
@@ -452,10 +474,16 @@ class DDPM(BaseGenerativeModel):
     ):
         super().__init__(data_dim=data_dim, **kwargs)
         self.save_hyperparameters()
-        
+
+        if prediction_type not in _DDPM_PREDICTION_TYPES:
+            raise ValueError(
+                f"prediction_type must be one of {_DDPM_PREDICTION_TYPES}, "
+                f"got {prediction_type!r}."
+            )
+
         self.num_timesteps = num_timesteps
         self.prediction_type = prediction_type
-        
+
         # Build network
         self.net = DiffusionMLP(
             data_dim=data_dim,
@@ -597,7 +625,9 @@ class DDPM(BaseGenerativeModel):
             sqrt_alpha = self.sqrt_alphas_cumprod[t]
             sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t]
             pred_noise = sqrt_alpha * pred + sqrt_one_minus_alpha * x
-        
+        else:
+            raise ValueError(f"Unknown prediction type: {self.prediction_type}")
+
         # Compute x_{t-1}
         beta_t = self.betas[t]
         sqrt_recip_alpha = self.sqrt_recip_alphas[t]
@@ -612,9 +642,14 @@ class DDPM(BaseGenerativeModel):
         return mean
     
     @torch.no_grad()
-    def sample(self, n_generate: int, device: torch.device | None = None) -> torch.Tensor:
-        """Generate samples via reverse diffusion."""
-        device = device or self.device
+    def sample(
+        self,
+        n_generate: int,
+        device: torch.device | None = None,
+        cond: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Generate samples via reverse diffusion. ``cond`` is unused for DDPM."""
+        device = device if device is not None else self.device
         x = torch.randn(n_generate, self.data_dim, device=device)
         
         for t in reversed(range(self.num_timesteps)):
@@ -645,7 +680,7 @@ class CFM(BaseGenerativeModel):
     def __init__(
         self,
         data_dim: int,
-        hidden_dims: Union[List[int], int] = 256,
+        hidden_dims: list[int] | int = 256,
         time_embed_dim: int = 64,
         sigma: float = 0.0,  # Noise in interpolation path
         solver: str = "dopri5",  # ODE solver: "dopri5", "euler", "midpoint", "rk4"
@@ -838,15 +873,21 @@ class CFM(BaseGenerativeModel):
         return loss
     
     @torch.no_grad()
-    def sample(self, n_generate: int, device: torch.device | None = None, cond: torch.Tensor | None = None) -> torch.Tensor:
+    def sample(
+        self,
+        n_generate: int,
+        device: torch.device | None = None,
+        cond: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Generate samples by integrating the learned velocity field.
-        
+
         Args:
-            n_generate: Number of samples to generate
-            device: Device to generate samples on
-            cond: Conditioning data for conditional mode [n_generate, cond_dim]
+            n_generate: Number of samples to generate.
+            device:     Device to generate samples on.
+            cond:       Conditioning data for conditional mode
+                        ``[n_generate, cond_dim]``.
         """
-        device = device or self.device
+        device = device if device is not None else self.device
         x0 = torch.randn(n_generate, self.data_dim, device=device)
         return self.reconstruct(x0, cond=cond)
     

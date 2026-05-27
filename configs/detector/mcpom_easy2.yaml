@@ -1,9 +1,0 @@
-# MC-POM detector: easy
-# Light momentum smearing (σ=1.0)
-
-defaults:
-  - compose
-
-detectors:
-  - _target_: jetprism.detectors.MomentumSmearing
-    sigma: 1.0

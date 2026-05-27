@@ -1,8 +1,28 @@
+"""Plotting and checkpoint-handling utilities for ScatterPrism.
+
+Provides:
+    * MC-POM-aware distribution plots (1-D, 24-channel grids, per-group).
+    * Flow-trajectory visualisation for trained CFM checkpoints.
+    * Checkpoint-evolution grids and overlays for training-time monitoring.
+    * Helpers for loading models and per-dimension Gaussian fits.
+"""
+
 import logging
-import matplotlib.pyplot as plt
-import os
 import math
+import os
+import re
+from pathlib import Path
+
+import hydra.utils as _hu
+import matplotlib.pyplot as plt
 import numpy as np
+import torch
+import yaml
+from scipy.stats import norm as _norm
+from torch.utils.data import random_split
+
+from scatterprism.models import CFM
+from scatterprism.transforms import BaseTransform
 
 log = logging.getLogger(__name__)
 
@@ -15,9 +35,11 @@ COLOR_DETECTOR = '#CC79A7'    # Pink/magenta - detector/degraded data
 COLOR_CONTEXT = '#808080'     # Medium gray - reference lines
 COLOR_GEN_FILL = '#F5C97A'    # Lighter orange - fill for generated
 COLOR_MARKER = '#D55E00'      # Vermillion - boundary markers
+COLOR_RATIO = '#404040'       # Dark gray - ratio line in ratio sub-panels
+COLOR_BAND = '#CCCCCC'        # Light gray - +/-10% uncertainty band
 
 # ---------------------------------------------------------------------------
-# Shared MC-POM column / scale metadata used by all v0 plotting functions
+# Shared MC-POM column / scale metadata used by all MC-POM plotting functions
 # ---------------------------------------------------------------------------
 # Delta function columns excluded: photon_y, target_proton_y, recoil_proton_x, recoil_proton_y
 _MCPOM_COLS_LIST = [
@@ -193,7 +215,7 @@ def plot_distributions_diff_1d(truth, generated, output_path, label_a='Truth', l
     log.info(f"Saved 1D diff plot to {output_path}")
 
 
-def plot_distributions_v0(dataset, output_filepath):
+def plot_distributions_mcpom(dataset, output_filepath):
     """Plot per-column distributions for a single MC-POM 24-column dataset.
 
     Produces a 6x4 grid of normalised histograms, one per MC-POM column.
@@ -207,7 +229,6 @@ def plot_distributions_v0(dataset, output_filepath):
     fig, axes = plt.subplots(nrows=6, ncols=4, figsize=(20, 18))
     axes = axes.flatten()
 
-    scales = _MCPOM_SCALES
     num_bins = 200
 
     for i, col in enumerate(cols_to_plot):
@@ -237,10 +258,10 @@ def plot_distributions_v0(dataset, output_filepath):
     log.info(f"Plot saved as {output_filepath}")
 
 
-def plot_distributions_diff_v0(dataset_a, dataset_b, output_filepath, label_a='Original', label_b='Detector'):
+def plot_distributions_diff_mcpom(dataset_a, dataset_b, output_filepath, label_a='Original', label_b='Detector'):
     """Plot an overlay comparison of two MC-POM datasets across all 24 columns.
 
-    Convenience wrapper around :func:`plot_distributions_multiple_v0` for
+    Convenience wrapper around :func:`plot_distributions_multiple_mcpom` for
     exactly two datasets with distinct fill/line styling.
 
     Args:
@@ -294,15 +315,15 @@ def plot_distributions_diff_v0(dataset_a, dataset_b, output_filepath, label_a='O
     fig.legend(handles, labels, loc='lower center', ncol=4,
                fontsize=14, bbox_to_anchor=(0.5, 0.01))
     plt.tight_layout(rect=[0, 0.03, 1, 1])
-    os.makedirs('figures', exist_ok=True)
+    os.makedirs(os.path.dirname(output_filepath) or '.', exist_ok=True)
     plt.savefig(output_filepath, dpi=200, bbox_inches='tight')
     plt.close(fig)
     log.info(f"Comparison plot with colored difference saved as {output_filepath}")
 
 
-def plot_distributions_multiple_v0(datasets, output_filepath, *,
-                                   cols: dict[str, int] | None = None,
-                                   extra_text: list[str] | None = None):
+def plot_distributions_multiple_mcpom(datasets, output_filepath, *,
+                                      cols: dict[str, int] | None = None,
+                                      extra_text: list[str] | None = None):
     """Plot and compare distributions of multiple datasets across MC-POM columns.
 
     Produces a grid of normalised histogram overlays (one subplot per column)
@@ -332,7 +353,7 @@ def plot_distributions_multiple_v0(datasets, output_filepath, *,
 
     scales = _MCPOM_SCALES
     num_bins = 200
-    colors = plt.cm.get_cmap('tab10', len(datasets))
+    colors = plt.get_cmap('tab10', len(datasets))
 
     for i, (col, data_idx) in enumerate(cols.items()):
         ax = axes[i]
@@ -400,35 +421,6 @@ def plot_distributions_multiple_v0(datasets, output_filepath, *,
     plt.savefig(output_filepath, dpi=200, bbox_inches='tight')
     plt.close(fig)
     log.info(f"Comparison plot saved as {output_filepath}")
-
-
-# Column subset used by plot_distributions_multiple_no_delta_v0 (no near-zero columns)
-_MCPOM_COLS_NO_DELTA: dict[str, int] = {
-    't': 0, 'mpipi': 1, 'costh': 2, 'phi': 3,
-    'photon_t': 4, 'photon_x': 5, 'photon_z': 7,
-    'target_proton_t': 8, 'target_proton_x': 9, 'target_proton_z': 11,
-    'pi_plus_t': 12, 'pi_plus_x': 13, 'pi_plus_y': 14, 'pi_plus_z': 15,
-    'pi_minus_t': 16, 'pi_minus_x': 17, 'pi_minus_y': 18, 'pi_minus_z': 19,
-    'recoil_proton_t': 20, 'recoil_proton_z': 23,
-}
-
-
-def plot_distributions_multiple_no_delta_v0(datasets, output_filepath,
-                                            extra_text: list[str] | None = None):
-    """Plot multi-dataset comparison for the 20-column MC-POM subset (no near-zero columns).
-
-    Thin wrapper around :func:`plot_distributions_multiple_v0` using
-    ``_MCPOM_COLS_NO_DELTA`` as the column selection.
-
-    Args:
-        datasets:        ``{label: array}`` dict.  Each array is ``[N, 24]``.
-        output_filepath: Path to save the output image.
-        extra_text:      Optional per-column annotation strings (indexed by data
-                         column index, length >= 24).
-    """
-    plot_distributions_multiple_v0(datasets, output_filepath,
-                                   cols=_MCPOM_COLS_NO_DELTA,
-                                   extra_text=extra_text)
 
 
 # ============================================================
@@ -579,42 +571,117 @@ def plot_generated_vs_truth(gen: np.ndarray, truth, output_dir: str,
 # Flow trajectory analysis (from plot_flow_trajectory.py)
 # ============================================================
 
-def load_model_from_checkpoint(checkpoint_path: str, device):
-    """Load a trained model from a .ckpt file.
+def find_best_checkpoint(run_dir, *, allow_fallback: bool = False):
+    """Locate the best model checkpoint inside a run directory.
 
-    Uses ``model_target`` stored by CheckpointMetadataCallback when available,
-    otherwise falls back to heuristic detection from hyper-parameters.
+    Default (``allow_fallback=False``): only ``checkpoints/best.ckpt`` is
+    accepted; raises :class:`FileNotFoundError` if it does not exist.
+
+    With ``allow_fallback=True``: search
+    ``final_model.ckpt`` → ``checkpoints/best.ckpt`` → ``checkpoints/last.ckpt``
+    (``final_model.ckpt`` is the in-training copy of best; ``last.ckpt`` is the
+    final-epoch fallback for partial runs).
+
+    Args:
+        run_dir:        Path-like run directory.
+        allow_fallback: Enable the three-way fallback search.
 
     Returns:
-        model:     Loaded, eval-mode PyTorch Lightning model on *device*
-        transform: Deserialized transform (or None if not stored)
-    """
-    import torch
+        ``pathlib.Path`` to the located checkpoint.
 
+    Raises:
+        FileNotFoundError: If no acceptable checkpoint exists.
+    """
+    run_dir = Path(run_dir)
+    if allow_fallback:
+        candidates = [
+            run_dir / "final_model.ckpt",
+            run_dir / "checkpoints" / "best.ckpt",
+            run_dir / "checkpoints" / "last.ckpt",
+        ]
+        for c in candidates:
+            if c.exists():
+                return c
+        raise FileNotFoundError(
+            f"No checkpoint found in {run_dir}; tried "
+            f"final_model.ckpt, checkpoints/best.ckpt, checkpoints/last.ckpt"
+        )
+    best = run_dir / "checkpoints" / "best.ckpt"
+    if not best.exists():
+        raise FileNotFoundError(
+            f"checkpoints/best.ckpt not found in {run_dir}. "
+            f"Pass --all-available-ckpts to enable fallback search "
+            f"(final_model.ckpt -> checkpoints/best.ckpt -> checkpoints/last.ckpt)."
+        )
+    return best
+
+
+def find_best_samples(run_dir, *, allow_fallback: bool = False):
+    """Locate the best-checkpoint generated samples ``.npz`` in a run directory.
+
+    Default (``allow_fallback=False``): only ``generated_samples_best.npz`` is
+    accepted; raises :class:`FileNotFoundError` if it does not exist.
+
+    With ``allow_fallback=True``: search
+    ``generated_samples_best.npz`` → ``generated_samples_last.npz``.
+
+    Args:
+        run_dir:        Path-like run directory.
+        allow_fallback: Enable the two-way fallback search.
+
+    Returns:
+        ``pathlib.Path`` to the located samples file.
+
+    Raises:
+        FileNotFoundError: If no acceptable samples file exists.
+    """
+    run_dir = Path(run_dir)
+    best = run_dir / "generated_samples_best.npz"
+    if best.exists():
+        return best
+    if allow_fallback:
+        last = run_dir / "generated_samples_last.npz"
+        if last.exists():
+            return last
+        raise FileNotFoundError(
+            f"No samples found in {run_dir}; tried "
+            f"generated_samples_best.npz, generated_samples_last.npz"
+        )
+    raise FileNotFoundError(
+        f"generated_samples_best.npz not found in {run_dir}. "
+        f"Pass --all-available-ckpts to enable fallback search "
+        f"(generated_samples_best.npz -> generated_samples_last.npz)."
+    )
+
+
+def load_model_from_checkpoint(checkpoint_path: str, device):
+    """Load a trained model from a ``.ckpt`` file.
+
+    Prefers the ``model_target`` injected by :class:`CheckpointMetadataCallback`;
+    falls back to :class:`scatterprism.models.CFM` when missing.
+
+    Returns:
+        ``(model, transform)`` — eval-mode Lightning model on *device* and the
+        deserialised transform (or ``None`` if none was stored).
+    """
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    model_class = None
     if 'model_target' in checkpoint:
-        import hydra.utils as _hu
         model_target = checkpoint['model_target']
         model_class = _hu.get_class(model_target)
         log.info(f"Auto-detected model type from checkpoint: {model_target}")
     else:
-        from jetprism.models import CFM
         model_class = CFM
         log.info(f"Heuristic model detection: {model_class.__name__}")
 
     model = model_class.load_from_checkpoint(
-        checkpoint_path,
-        map_location=device,
-        weights_only=False,
+        checkpoint_path, map_location=device, weights_only=False,
     )
     model.eval()
     model.to(device)
 
     transform = None
     if 'transform_state' in checkpoint:
-        from jetprism.transforms import BaseTransform
         transform = BaseTransform.deserialize(checkpoint['transform_state'])
         if transform is not None:
             log.info("Loaded transform from checkpoint")
@@ -623,14 +690,12 @@ def load_model_from_checkpoint(checkpoint_path: str, device):
 
 
 def get_flow_trajectory(model, n_generate: int, num_steps: int, device):
-    """Generate a flow trajectory from t=0 (Gaussian) to t=1 (target).
+    """Generate a flow trajectory from ``t=0`` (Gaussian) to ``t=1`` (target).
 
     Returns:
-        trajectory: numpy array [num_steps, n_generate, data_dim]
-        t_values:   numpy array [num_steps]
+        ``(trajectory, t_values)`` — numpy arrays of shape
+        ``[num_steps, n_generate, data_dim]`` and ``[num_steps]``.
     """
-    import torch
-
     x0 = torch.randn(n_generate, model.data_dim, device=device)
     trajectory = model.get_trajectory(x0, num_steps=num_steps)
     t_values = np.linspace(0, 1, num_steps)
@@ -713,8 +778,6 @@ def plot_flow_trajectory_for_checkpoint(checkpoint_path: str, output_dir: str,
         device:          torch.device or None (auto-detect)
         save_format:     Output format ('png' or 'pdf')
     """
-    import torch
-
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -729,7 +792,13 @@ def plot_flow_trajectory_for_checkpoint(checkpoint_path: str, output_dir: str,
 
     data_dim = model.data_dim
     is_1d = (data_dim == 1)
-    dim1, dim2 = dims
+    # Accept 1-element dims for 1-D data; pad with 0 so the 2-D-only branches
+    # still have two indices even though they will be skipped when is_1d.
+    if len(dims) == 1:
+        dim1 = dims[0]
+        dim2 = dims[0]
+    else:
+        dim1, dim2 = dims[0], dims[1]
 
     if plot_type in ('density', 'all'):
         if is_1d:
@@ -761,7 +830,7 @@ def plot_flow_trajectory_for_checkpoint(checkpoint_path: str, output_dir: str,
             log.info(f"Saved flow scatter plot to {sp}")
 
     if plot_type in ('marginal', 'all'):
-        valid_dims = [d for d in (dim1, dim2) if d < data_dim] or [0]
+        valid_dims = list(dict.fromkeys(d for d in (dim1, dim2) if d < data_dim)) or [0]
         for dim in valid_dims:
             num_time_points = 6
             time_indices = np.linspace(0, trajectory.shape[0] - 1,
@@ -804,9 +873,6 @@ def find_checkpoints(ckpt_dir) -> list:
     Returns:
         List of ``(epoch_number, pathlib.Path)`` tuples sorted by epoch.
     """
-    import re
-    from pathlib import Path
-
     ckpt_dir = Path(ckpt_dir)
     candidates = list(ckpt_dir.glob("epoch_*.ckpt"))
     if not candidates and (ckpt_dir / "checkpoints").is_dir():
@@ -837,11 +903,8 @@ def load_checkpoint_transform(ckpt_dir, device=None):
         device:   ``torch.device`` for checkpoint loading (default: CPU).
 
     Returns:
-        Deserialized :class:`~jetprism.transforms.BaseTransform` or *None*.
+        Deserialized :class:`~scatterprism.transforms.BaseTransform` or ``None``.
     """
-    import torch
-    from pathlib import Path
-
     ckpt_dir = Path(ckpt_dir)
     if device is None:
         device = torch.device('cpu')
@@ -850,7 +913,6 @@ def load_checkpoint_transform(ckpt_dir, device=None):
     if ckpt_path.exists():
         checkpoint = torch.load(str(ckpt_path), map_location=device, weights_only=False)
         if "transform_state" in checkpoint:
-            from jetprism.transforms import BaseTransform
             transform = BaseTransform.deserialize(checkpoint["transform_state"])
             if transform is not None:
                 log.info(f"Loaded transform from {ckpt_path.name}")
@@ -859,18 +921,7 @@ def load_checkpoint_transform(ckpt_dir, device=None):
 
 
 def _generate_checkpoint_samples(model, n_generate: int, device) -> np.ndarray:
-    """Generate *n_generate* from an already-loaded, eval-mode model.
-
-    Args:
-        model:       A Lightning model with a ``.sample()`` method.
-        n_generate: Number of samples to draw.
-        device:      ``torch.device`` to run inference on.
-
-    Returns:
-        Numpy array of shape ``[n_generate, data_dim]``.
-    """
-    import torch
-
+    """Generate *n_generate* samples from an already-loaded, eval-mode model."""
     model.eval()
     model.to(device)
     with torch.no_grad():
@@ -896,8 +947,6 @@ def plot_checkpoint_evolution_grid(checkpoints: list, n_generate: int, device,
         bins:        Number of histogram bins.
         value_range: ``(xmin, xmax)`` tuple; defaults to ``(-5, 5)``.
     """
-    import torch
-
     n = len(checkpoints)
     ncols = min(5, n)
     nrows = math.ceil(n / ncols)
@@ -970,8 +1019,6 @@ def plot_checkpoint_evolution_overlay(checkpoints: list, n_generate: int, device
         bins:        Number of histogram bins.
         value_range: ``(xmin, xmax)`` tuple; defaults to ``(-5, 5)``.
     """
-    import torch
-
     n = len(checkpoints)
     if value_range is None:
         value_range = (-5, 5)
@@ -1042,9 +1089,6 @@ def run_checkpoint_evolution_plot(run_dir: str, device=None,
         every_n:      Keep only every n-th checkpoint (first + last always kept)
         overlay:      Also produce the overlay plot
     """
-    import torch
-    from pathlib import Path
-
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -1110,8 +1154,6 @@ def fit_gaussian_per_dim(samples: np.ndarray) -> list:
     Returns:
         List of ``(mean, std)`` tuples, one per dimension.
     """
-    from scipy.stats import norm as _norm
-
     return [_norm.fit(samples[:, d]) for d in range(samples.shape[1])]
 
 
@@ -1135,10 +1177,8 @@ def fit_and_compare_gaussian(samples: np.ndarray, truth,
         col_names:  Optional column name list (length D)
 
     Returns:
-        List of (mean, std) tuples for the generated samples.
+        List of ``(mean, std)`` tuples for the generated samples.
     """
-    from scipy.stats import norm as _norm
-
     fit_results = fit_gaussian_per_dim(samples)
     n_dims = samples.shape[1]
     n_cols = min(4, n_dims)
@@ -1212,16 +1252,72 @@ def fit_and_compare_gaussian(samples: np.ndarray, truth,
 
     return fit_results
 
-def plot_distributions_multiple_1d(datasets, output_filepath):
-    """Plot and compare distributions of multiple 1D datasets overlaid.
-    
-    Args:
-        datasets: Dict of {label: numpy array} to plot.
-        output_filepath: Path to save the plot.
-    """
-    import matplotlib.pyplot as plt
-    import numpy as np
+def _reproduce_split_indices(run_dir, total_size: int, which: str) -> np.ndarray:
+    """Re-run the seeded ``random_split`` and return indices for one partition.
 
+    ``which`` is one of ``"train"``, ``"val"``, ``"test"``.  Reads
+    ``split_ratios`` and ``random_seed`` from ``<run_dir>/.hydra/config.yaml``.
+    Falls back to ``arange(total_size)`` when the requested partition is empty
+    or the config cannot be located.
+    """
+    if which not in ("train", "val", "test"):
+        raise ValueError(f"which must be 'train'|'val'|'test', got {which!r}")
+
+    run_dir = Path(run_dir)
+    cfg_path = run_dir / ".hydra" / "config.yaml"
+    if not cfg_path.exists():
+        log.warning(f"No .hydra/config.yaml in {run_dir}; falling back to full set")
+        return np.arange(total_size, dtype=np.int64)
+
+    with open(cfg_path) as f:
+        cfg = yaml.safe_load(f) or {}
+    ds = (cfg.get("dataset") or {})
+    split_ratios = tuple(ds.get("split_ratios", (1.0, 0.0, 0.0)))
+    raw_seed = ds.get("random_seed")
+
+    train_size = int(split_ratios[0] * total_size)
+    val_size   = int(split_ratios[1] * total_size)
+    test_size  = total_size - train_size - val_size
+    sizes = {"train": train_size, "val": val_size, "test": test_size}
+    if sizes[which] <= 0:
+        log.info(f"No {which} partition (split_ratios={split_ratios}); using full set")
+        return np.arange(total_size, dtype=np.int64)
+
+    if raw_seed is None:
+        log.warning(
+            f"{cfg_path} has no random_seed — split was non-deterministic "
+            f"and cannot be reproduced; returning full set"
+        )
+        return np.arange(total_size, dtype=np.int64)
+    seed = int(raw_seed)
+
+    gen = torch.Generator().manual_seed(seed)
+    train_set, val_set, test_set = random_split(
+        list(range(total_size)), [train_size, val_size, test_size], generator=gen,
+    )
+    chosen = {"train": train_set, "val": val_set, "test": test_set}[which]
+    idx = np.asarray(list(chosen.indices), dtype=np.int64)
+    log.info(f"Reproduced {which} split: {len(idx):,} events (seed={seed}, split={split_ratios})")
+    return idx
+
+
+def reproduce_train_indices(run_dir, total_size: int) -> np.ndarray:
+    """Reproduce the training-split indices from a run's seeded ``random_split``."""
+    return _reproduce_split_indices(run_dir, total_size, "train")
+
+
+def reproduce_test_indices(run_dir, total_size: int) -> np.ndarray:
+    """Reproduce the held-out test indices from a run's seeded ``random_split``."""
+    return _reproduce_split_indices(run_dir, total_size, "test")
+
+
+def plot_distributions_multiple_1d(datasets: dict, output_filepath: str) -> None:
+    """Overlay 1-D density histograms of several datasets on a single axis.
+
+    Args:
+        datasets:         ``{label: array}`` dict; each array is flattened to 1-D.
+        output_filepath:  Path for the saved figure.
+    """
     plt.figure(figsize=(10, 6))
     
     combined = np.concatenate([np.array(d).flatten() for d in datasets.values()])
@@ -1241,6 +1337,8 @@ def plot_distributions_multiple_1d(datasets, output_filepath):
     plt.title("1D Distribution Comparison")
     plt.legend()
     plt.tight_layout()
+    os.makedirs(os.path.dirname(output_filepath) or ".", exist_ok=True)
     plt.savefig(output_filepath, dpi=300)
     plt.close()
+    log.info(f"Saved 1D multi-distribution plot to {output_filepath}")
 

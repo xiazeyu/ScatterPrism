@@ -1,4 +1,6 @@
+# Delta function at x = 0 — degenerate distribution, stress-tests point-mass behaviour.
+
 defaults:
   - delta
 
-center: 0.0 # Delta function centered at this value (default 0)
+center: 0.0

@@ -1,30 +1,43 @@
 #!/usr/bin/env python3
 """
-Benchmark training and inference time for JetPrism CFM models on GPU and CPU.
+Compute-throughput benchmark — Table 4 (Appendix F).
 
-Benchmarks two configurations matching the project's experiment configs:
-  1. Generation  (mcpom_gen.yaml):     unconditional CFM, ResNet 512x6, dopri5
-  2. Denoising   (mcpom_denoise.yaml): conditional CFM,   ResNet 512x6, dopri5
+Measures training and inference throughput for the two CFM configurations
+used in the manuscript:
 
-Measures:
-  - Training throughput (forward + backward + optimizer step per batch)
-  - Inference / sampling time (generating N samples via ODE integration)
+  1. Generation  (``mcpom_gen.yaml``)     — unconditional CFM, ResNet 512x6,
+                                            DOPRI5 (atol = rtol = 1e-7).
+  2. Denoising   (``mcpom_denoise.yaml``) — conditional CFM, ResNet 512x6,
+                                            DOPRI5 (atol = rtol = 1e-3).
+
+Reports:
+  * Training throughput — forward + backward + optimiser step per batch.
+  * Inference throughput — sampling N events via ODE integration.
+
+Inputs:
+    None (uses synthetic random tensors matching the production shapes).
+
+Outputs:
+    Console summary table; optionally ``--output benchmark.json``.
 
 Usage:
-    python scripts/benchmark_timing.py [options]
+    python scripts/10_benchmark_timing.py [options]
 
 Examples:
-    # Quick benchmark (auto-detects GPU/CPU)
-    python scripts/benchmark_timing.py
+    # Auto-detect GPU/CPU
+    python scripts/10_benchmark_timing.py
 
     # Longer benchmark with more iterations
-    python scripts/benchmark_timing.py --epochs 20
+    python scripts/10_benchmark_timing.py --epochs 20
 
-    # Benchmark only on GPU
-    python scripts/benchmark_timing.py --devices cuda
+    # Restrict to GPU only and persist results
+    python scripts/10_benchmark_timing.py --devices cuda \\
+        --output outputs/benchmark_a100.json
 
-    # Save results to JSON
-    python scripts/benchmark_timing.py --output outputs/benchmark.json
+Notes:
+    The benchmark uses freshly-initialised models with random inputs — no
+    data split is involved. The numbers are intentionally hardware-bound and
+    independent of dataset content.
 """
 
 import argparse
@@ -39,10 +52,10 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-# Add project root to path so we can import jetprism
+# Add project root to path so we can import scatterprism
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from jetprism.models import CFM, sample_conditional_pt, compute_conditional_vector_field
+from scatterprism.models import CFM, sample_conditional_pt, compute_conditional_vector_field
 
 
 # ── Model configs matching experiment YAMLs ──────────────────────────────────
@@ -86,7 +99,7 @@ BATCH_SIZE = 20000  # matches dataset.batch_size in both experiment configs
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Benchmark training and inference time for JetPrism CFM models"
+        description="Benchmark training and inference time for ScatterPrism CFM models"
     )
     parser.add_argument("--epochs", type=int, default=10,
                         help="Training iterations (batches) to time (default: 10)")
@@ -290,7 +303,7 @@ def main():
 
     print()
     sep("═")
-    print("  JetPrism CFM Benchmark — Training & Inference Timing")
+    print("  ScatterPrism CFM Benchmark — Training & Inference Timing")
     sep("═")
     print()
     print(f"  Date:           {sysinfo['timestamp']}")

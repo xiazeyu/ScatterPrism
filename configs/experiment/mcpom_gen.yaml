@@ -1,4 +1,7 @@
 # @package _global_
+#
+# MC-POM generation experiment (default channel set).
+# Train a CFM (ResNet backbone) on unpaired MC-POM particle-level data.
 
 defaults:
   - override /model: cfm
@@ -9,7 +12,7 @@ defaults:
 
 experiment:
   name: cfm_mcpom_gen
-  description: Base experiment for training with ResNet on CFM using MCPOM.
+  description: CFM/ResNet trained on MC-POM particle-level data (generation task).
 
 mode: TRAIN
 predict: true
@@ -17,7 +20,7 @@ predict_best_only: true
 save_samples: all
 
 trainer:
-  epochs: 800
+  epochs: 1000
   log_interval: 10
   val_interval: 10
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SLURM script generator and submitter for JetPrism training/inference jobs.
+"""SLURM script generator and submitter for ScatterPrism training/inference jobs.
 
 Usage examples
 --------------
@@ -13,12 +13,15 @@ python slurm_submit.py --submit -- python main.py +experiment=mcpom_gen
 python slurm_submit.py --submit -- python main.py -m model=cfm,ddpm dataset=gaussian,highcut
 
 # Predict (accepts run directory or checkpoint file)
+# checkpoint_path / runs_dir are part of the structured Config — set them
+# without a leading `+` (the `+` is for adding *new* keys that aren't in
+# the schema).
 python slurm_submit.py --submit -- python main.py mode=PREDICT \\
-    +checkpoint_path=outputs/2026-02-17/19-16-46_abc12345 n_generate=4000000
+    checkpoint_path=outputs/2026-02-17/19-16-46_abc12345 n_generate=4000000
 
 # Batch predict (all runs under a sweep directory)
 python slurm_submit.py --submit -- python main.py mode=BATCH_PREDICT \\
-    +runs_dir=multirun/2026-02-11/17-09-18 n_generate=4000000
+    runs_dir=multirun/2026-02-11/17-09-18 n_generate=4000000
 
 # Override any SLURM option
 python slurm_submit.py --time 24:00:00 --mem 32G --submit -- python main.py +experiment=mcpom_gen
@@ -31,10 +34,18 @@ import argparse
 import itertools
 import os
 import re
+import shlex
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+
+
+def _shell_join(tokens: list[str]) -> str:
+    """Join argv tokens for a bash script, quoting any with shell-special chars
+    so the SLURM script doesn't try to expand things like Hydra resolvers
+    (e.g. `${hydra:runtime.choices.dataset}`) under `set -u`."""
+    return " ".join(shlex.quote(t) for t in tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +58,7 @@ DEFAULTS = dict(
     nodes=1,
     cpus_per_task=4,
     mem="24G",
-    time="12:00:00",
+    time="18:00:00",
 )
 
 
@@ -99,7 +110,7 @@ def infer_job_name(cmd_tokens: list[str]) -> str:
     if is_multirun:
         name = f"sweep_{name}"
 
-    return name or "jetprism_job"
+    return name or "scatterprism_job"
 
 
 # ---------------------------------------------------------------------------
@@ -172,49 +183,6 @@ def expand_sweep_combinations(cmd_tokens: list[str]) -> list[list[str]]:
             tokens.append(f"{k}={v}")
         combos.append(tokens)
     return combos
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _time_to_minutes(time_str: str) -> int:
-    """Convert HH:MM:SS or H:MM:SS or plain integer string to minutes."""
-    parts = time_str.strip().split(":")
-    if len(parts) == 3:
-        return int(parts[0]) * 60 + int(parts[1])
-    elif len(parts) == 2:
-        return int(parts[0])
-    return int(parts[0])
-
-
-def _mem_to_gb(mem_str: str) -> int:
-    """Convert '16G', '16384M', or bare integer string to integer GB."""
-    s = mem_str.strip()
-    if s.upper().endswith("G"):
-        return int(s[:-1])
-    if s.upper().endswith("M"):
-        return max(1, int(s[:-1]) // 1024)
-    return int(s)
-
-
-def _parse_python_cmd(cmd_tokens: list[str]) -> tuple[Path, list[str]]:
-    """Strip a leading 'python'/'python3' token and resolve the script path.
-
-    Returns ``(script_path, remaining_args)``.
-    """
-    tokens = list(cmd_tokens)
-    # Strip leading interpreter (python / python3 / python3.11 …)
-    if tokens and re.match(r'python\d*(\.\d+)?$', tokens[0]):
-        tokens = tokens[1:]
-    if not tokens:
-        raise ValueError("No script found in command tokens")
-    script = Path(tokens[0])
-    if not script.is_absolute():
-        candidate = Path(__file__).parent / script
-        if candidate.exists():
-            script = candidate
-    return script.resolve(), tokens[1:]
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +282,7 @@ def build_slurm_script(
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
-        description="Generate (and optionally submit) a SLURM script for JetPrism.",
+        description="Generate (and optionally submit) a SLURM script for ScatterPrism.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -434,7 +402,7 @@ def main() -> None:
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         for idx, combo_tokens in enumerate(combos):
-            combo_cmd = " ".join(combo_tokens)
+            combo_cmd = _shell_join(combo_tokens)
             combo_name = f"{job_name_base}_{idx}"
             combo_desc = " ".join(
                 t for t in combo_tokens
@@ -469,7 +437,7 @@ def main() -> None:
         return
 
     # ── Single job ───────────────────────────────────────────────────────
-    cmd = " ".join(cmd_tokens)
+    cmd = _shell_join(cmd_tokens)
     job_name = args.job_name or infer_job_name(cmd_tokens)
     print(f"[slurm_submit] Job name : {job_name}", file=sys.stderr)
 

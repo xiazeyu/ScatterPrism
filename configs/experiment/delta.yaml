@@ -1,4 +1,8 @@
 # @package _global_
+#
+# Delta-function generation experiment.
+# Train a CFM (ResNet backbone) on the degenerate delta distribution to
+# probe the model's behaviour at a point-mass target.
 
 defaults:
   - override /model: cfm
@@ -16,7 +20,7 @@ predict_best_only: true
 save_samples: all
 
 trainer:
-  epochs: 800
+  epochs: 1000
   log_interval: 10
   val_interval: 10
 

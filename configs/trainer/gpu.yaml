@@ -1,6 +1,0 @@
-# Force CUDA device
-
-defaults:
-  - default
-
-device: cuda

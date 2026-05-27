@@ -1,4 +1,4 @@
-# MC-POM paired mode (detector → particle-level reconstruction)
+# MC-POM, paired mode: detector ↔ particle-level pairs (denoising / unfolding).
 
 defaults:
   - mcpom

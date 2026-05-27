@@ -1,7 +1,10 @@
+# Three overlapping Gaussians with mixed weights and widths.
+
 defaults:
   - multipeak
 
-# (mean, std, weight)
-peaks: [[0.0, 1.0, 0.7], [2.5, 0.8, 0.3], [5.0, 1.5, 0.34]]
-
-# two tall ones, not too far apart.
+# [mean, std, weight]
+peaks:
+  - [0.0, 1.0, 0.70]
+  - [2.5, 0.8, 0.30]
+  - [5.0, 1.5, 0.34]

@@ -1,4 +1,4 @@
-# Normal / standard Gaussian — easiest baseline / sanity check
+# Standard normal N(0, 1) — baseline sanity check.
 
 defaults:
   - gaussian

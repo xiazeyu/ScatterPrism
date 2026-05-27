@@ -1,7 +1,10 @@
+# Two equally weighted Gaussians at nearly the same location: one narrow, one wide.
+# Tests the model's ability to disentangle overlapping scales.
+
 defaults:
   - multipeak
 
-# (mean, std, weight)
-peaks: [[0.2, 0.3, 0.5], [0.0, 2.0, 0.5]]
-
-# one narrow peak mixed with one wide peak at the same location.
+# [mean, std, weight]
+peaks:
+  - [0.2, 0.3, 0.5]
+  - [0.0, 2.0, 0.5]

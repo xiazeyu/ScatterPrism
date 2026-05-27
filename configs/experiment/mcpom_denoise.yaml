@@ -1,15 +1,21 @@
 # @package _global_
+#
+# MC-POM denoising experiment.
+# Train a conditional CFM (ResNet backbone) on paired MC-POM data with an
+# MC-POM smearing detector; the model learns to invert detector smearing.
+# Default detector preset is sigma=0.5; sweep `detector=mcpom_sigma_0.5,mcpom_sigma_1.0,mcpom_sigma_2.0`
+# for the JINST paper's three smearing strengths.
 
 defaults:
   - override /model: cfm
   - override /dataset: paired_mcpom
-  - override /detector: mcpom_easy
+  - override /detector: mcpom_sigma_0.5
   - override /transform: default_pom
   - _self_
 
 experiment:
   name: cfm_mcpom_denoise
-  description: Base experiment for training with ResNet on CFM using MCPOM. The model is trained to denoise the input.
+  description: Conditional CFM/ResNet trained on paired MC-POM data (denoising task).
 
 mode: TRAIN
 predict: true
@@ -17,7 +23,7 @@ predict_best_only: true
 save_samples: all
 
 trainer:
-  epochs: 800
+  epochs: 1000
   log_interval: 10
   val_interval: 10
 

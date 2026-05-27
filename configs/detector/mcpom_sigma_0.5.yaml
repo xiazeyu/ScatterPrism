@@ -1,0 +1,8 @@
+# MC-POM detector — momentum smearing only (σ = 0.5).
+
+defaults:
+  - compose
+
+detectors:
+  - _target_: scatterprism.detectors.MomentumSmearing
+    sigma: 0.5

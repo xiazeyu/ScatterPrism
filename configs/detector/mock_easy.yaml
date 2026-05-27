@@ -1,7 +1,0 @@
-# Mock detector: easy
-# Light general smearing (σ=0.1)
-
-defaults:
-  - general_smearing
-
-sigma: 0.1

@@ -1,15 +1,15 @@
-# MC-POM detector: hard
-# Heavy momentum smearing (σ=1.0) + tight cos(θ) cut (0.7) + k10 ≥ 0.3
+# MC-POM detector — hard:
+#   momentum smearing (σ = 1.0) + tight cos(θ) cut (0.7) + k10 ≥ 0.3 threshold.
 
 defaults:
   - compose
 
 detectors:
-  - _target_: jetprism.detectors.MomentumSmearing
+  - _target_: scatterprism.detectors.MomentumSmearing
     sigma: 1.0
-  - _target_: jetprism.detectors.CosThetaCut
+  - _target_: scatterprism.detectors.CosThetaCut
     threshold: 0.7
-  - _target_: jetprism.detectors.ValueCut
+  - _target_: scatterprism.detectors.ValueCut
     column: 'k10'
     min_value: 0.3
     max_value: null

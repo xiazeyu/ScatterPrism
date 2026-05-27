@@ -1,17 +1,30 @@
+"""Feature-space transformations applied between dataset and model.
+
+Each transform implements :class:`BaseTransform` (``fit`` / ``transform`` /
+``inverse_transform``) and can be composed via :class:`Compose`.  Transforms
+are serialised into checkpoints so that prediction-time inverse mapping is
+reproducible without re-fitting on the original training data.
+"""
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from hepunits.units import MeV, GeV
-from omegaconf import MISSING, DictConfig
-from hydra.utils import instantiate
-from jetprism import kinematic
-from jetprism.schemas import EventNumpy
-from particle.literals import photon, proton, pi_plus, pi_minus
 import logging
+
+from hepunits.units import MeV, GeV
+from hydra.utils import instantiate
+from omegaconf import MISSING, DictConfig
+from particle.literals import photon, proton, pi_plus, pi_minus
 import numpy as np
 import vector
-from typing import Self
+
+from scatterprism import kinematic
+from scatterprism.schemas import EventNumpy
 
 log = logging.getLogger(__name__)
+
+# arctanh(±1) diverges; clip φ/π just inside the unit interval so events with
+# φ exactly at ±π map to finite values rather than ±inf.
+_ARCTANH_PHI_CLIP = 1.0 - 1e-6
 
 
 @dataclass
@@ -52,19 +65,19 @@ class BaseTransform:
         return {'type': self.__class__.__name__}
 
     @staticmethod
-    def _deserialize(state: dict) -> callable:
+    def _deserialize(state: dict) -> "BaseTransform":
         raise NotImplementedError
 
     @staticmethod
-    def deserialize(state: dict) -> Self | None:
+    def deserialize(state: dict) -> "BaseTransform":
         """Deserialize transform from checkpoint state dictionary."""
         if state is None:
-            return None
+            return Identity()
 
         transform_type = state.get('type')
         if transform_type is None:
             log.warning("Transform state missing 'type' field")
-            return None
+            return Identity()
 
         # Map type names to classes and their deserialize methods
         type_map: dict[str, type[BaseTransform]] = {
@@ -80,7 +93,7 @@ class BaseTransform:
         cls = type_map.get(transform_type)
         if cls is None:
             log.warning(f"Unknown transform type: {transform_type}, skipping")
-            return None
+            return Identity()
 
         # Each class has its own deserialize implementation
         return cls._deserialize(state)
@@ -88,12 +101,12 @@ class BaseTransform:
 
 @dataclass
 class Compose(BaseTransform):
+    """Apply a sequence of :class:`BaseTransform` instances in order."""
 
-    transforms: list[BaseTransform] | None = None
+    transforms: list[BaseTransform] = field(
+        default_factory=lambda: [Identity()])
 
     def __post_init__(self):
-
-        assert self.transforms is not None, "Transforms list cannot be None"
 
         input_transformations = self.transforms
         self.transforms = []
@@ -129,13 +142,11 @@ class Compose(BaseTransform):
         }
 
     @staticmethod
-    def _deserialize(state: dict) -> Self | None:
+    def _deserialize(state: dict) -> "BaseTransform":
         """Deserialize Compose from state dictionary."""
         transforms = [BaseTransform.deserialize(t) for t in state.get('transforms', [])]
-        # Filter out None transforms
-        transforms = [t for t in transforms if t is not None]
         if not transforms:
-            return None
+            return Identity()  # No nested transforms, return Identity
         compose = Compose.__new__(Compose)
         compose.transforms = transforms
         # Compute dim_input/dim_output from first/last transform
@@ -144,7 +155,6 @@ class Compose(BaseTransform):
         return compose
 
     def fit(self, data: np.ndarray) -> None:
-        assert self.transforms is not None, "Transforms list cannot be None"
         self.dim_input = data.shape[1]
         last_column_names = None
         for transform in self.transforms:
@@ -162,13 +172,11 @@ class Compose(BaseTransform):
         self.dim_output = data.shape[1]
 
     def transform(self, data: np.ndarray) -> np.ndarray:
-        assert self.transforms is not None, "Transforms list cannot be None"
         for transform in self.transforms:
             data = transform.transform(data)
         return data
 
     def inverse_transform(self, data: np.ndarray) -> np.ndarray:
-        assert self.transforms is not None, "Transforms list cannot be None"
         for transform in reversed(self.transforms):
             data = transform.inverse_transform(data)
         return data
@@ -190,7 +198,7 @@ class Identity(BaseTransform):
         return data
 
     @staticmethod
-    def _deserialize(state: dict) -> Self:
+    def _deserialize(state: dict) -> "BaseTransform":
         """Deserialize Identity from state dictionary."""
         return Identity()
 
@@ -231,7 +239,7 @@ class StandardScaler(BaseTransform):
         }
 
     @staticmethod
-    def _deserialize(state: dict) -> Self:
+    def _deserialize(state: dict) -> "BaseTransform":
         """Deserialize StandardScaler from state dictionary."""
         transform = StandardScaler(
             mean=np.atleast_1d(np.array(state['mean'])) if state.get('mean') is not None else None,
@@ -253,6 +261,12 @@ class StandardScaler(BaseTransform):
         if self.mean is None and self.std is None:
             self.mean = np.mean(data, axis=0)
             self.std = np.std(data, axis=0)
+        elif self.mean is None or self.std is None:
+            raise ValueError(
+                "StandardScaler requires both `mean` and `std` to be set, "
+                "or both to be None for fitting. Got "
+                f"mean is None: {self.mean is None}, std is None: {self.std is None}."
+            )
         else:
             log.warning("StandardScaler is already fitted; fit() call ignored.")
         self.dim_output = data.shape[1]
@@ -303,13 +317,15 @@ class LogTransformer(BaseTransform):
         self.dim_output = data.shape[1]
         if self.columns is None:
             self.columns = list(range(data.shape[1]))
-        # Validate that data + offset > 0 for the selected columns
+        # Validate that data + offset > 0 for the selected columns; otherwise
+        # transform() would silently emit NaN/-inf and downstream training
+        # would break in non-obvious ways.
         min_vals = np.min(data[:, self.columns], axis=0)
         if np.any(min_vals + self.offset <= 0):
-            log.warning(
+            raise ValueError(
                 f"LogTransformer: some values in selected columns have "
                 f"data + offset <= 0 (min values: {min_vals}). "
-                f"Consider increasing offset."
+                f"Increase `offset` so the smallest value becomes strictly positive."
             )
 
     def transform(self, data: np.ndarray) -> np.ndarray:
@@ -325,22 +341,29 @@ class LogTransformer(BaseTransform):
         return out
 
     def serialize(self) -> dict:
-        """Serialize LogTransformer with columns and offset."""
+        """Serialize LogTransformer with columns, offset, and fit dims."""
         return {
             'type': 'LogTransformer',
             'columns': self.columns,
             'offset': self.offset,
+            'dim_input': self.dim_input,
+            'dim_output': self.dim_output,
         }
 
     @staticmethod
-    def _deserialize(state: dict) -> Self:
+    def _deserialize(state: dict) -> "BaseTransform":
         """Deserialize LogTransformer from state dictionary."""
         transform = LogTransformer(
             columns=state.get('columns'),
             offset=state.get('offset', 1.0),
         )
-        if transform.columns is not None:
+        transform.dim_input = state.get('dim_input')
+        transform.dim_output = state.get('dim_output')
+        # Back-compat: older checkpoints did not store dim_input/dim_output.
+        # Fall back to max(columns)+1, but only when nothing better is available.
+        if transform.dim_input is None and transform.columns is not None:
             transform.dim_input = max(transform.columns) + 1
+        if transform.dim_output is None:
             transform.dim_output = transform.dim_input
         return transform
 
@@ -423,7 +446,7 @@ class FourParticleRepresentation(BaseTransform):
         return out
 
     @staticmethod
-    def _deserialize(state: dict) -> Self:
+    def _deserialize(state: dict) -> "BaseTransform":
         """Deserialize FourParticleRepresentation from state dictionary."""
         transform = FourParticleRepresentation()
         transform.fit(np.zeros((1, 24)))  # Dummy fit to set dimensions
@@ -473,7 +496,7 @@ class ReduceRedundantv1(BaseTransform):
         return out
 
     @staticmethod
-    def _deserialize(state: dict) -> Self:
+    def _deserialize(state: dict) -> "BaseTransform":
         """Deserialize ReduceRedundantv1 from state dictionary."""
         transform = ReduceRedundantv1()
         transform.fit(np.zeros((1, 12)))  # Dummy fit to set dimensions
@@ -533,11 +556,17 @@ class DLPPRepresentation(BaseTransform):
             "mass": np.full(num_events, (pi_minus.mass * MeV) / GeV),
         })
 
+        def _phi_scaled(phi_arr: np.ndarray) -> np.ndarray:
+            # Clip phi/pi just inside [-1, 1] so arctanh stays finite for events
+            # with phi exactly at ±π (rare, but inevitable with O(1e7) events).
+            return np.arctanh(np.clip(phi_arr / np.pi,
+                                      -_ARCTANH_PHI_CLIP, _ARCTANH_PHI_CLIP))
+
         out = np.stack([
-            np.log(q.pt), q.eta, np.arctanh(q.phi / np.pi),
-            np.log(p1.pt), p1.eta, np.arctanh(p1.phi / np.pi),
-            np.log(k1.pt), k1.eta, np.arctanh(k1.phi / np.pi),
-            np.log(k2.pt), k2.eta, np.arctanh(k2.phi / np.pi),
+            np.log(q.pt),  q.eta,  _phi_scaled(q.phi),
+            np.log(p1.pt), p1.eta, _phi_scaled(p1.phi),
+            np.log(k1.pt), k1.eta, _phi_scaled(k1.phi),
+            np.log(k2.pt), k2.eta, _phi_scaled(k2.phi),
         ], axis=1)
 
         assert out.shape[1] == self.dim_output
@@ -599,7 +628,7 @@ class DLPPRepresentation(BaseTransform):
         return out
 
     @staticmethod
-    def _deserialize(state: dict) -> Self:
+    def _deserialize(state: dict) -> "BaseTransform":
         """Deserialize DLPPRepresentation from state dictionary."""
         transform = DLPPRepresentation()
         transform.fit(np.zeros((1, 24)))  # Dummy fit to set dimensions

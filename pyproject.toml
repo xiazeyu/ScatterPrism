@@ -1,5 +1,5 @@
 [project]
-name = "jetprism"
+name = "scatterprism"
 authors = [
     { name = "Zeyu Xia", email = "zeyu.xia@virginia.edu" },
     { name = "Tyler Kim", email = "tkj9ep@virginia.edu" },
@@ -10,7 +10,7 @@ authors = [
 ]
 license = { text = "MIT" }
 keywords = ["physics", "flow-matching", "generative-model", "particle-physics"]
-version = "0.1.0"
+version = "0.1.1"
 description = "A generative modeling framework using flow matching and diffusion to learn particle physics event distributions, supporting both unconditional generation and detector unfolding."
 readme = "README.md"
 requires-python = ">=3.12"

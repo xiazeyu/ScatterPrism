@@ -1,4 +1,8 @@
 # @package _global_
+#
+# Mock generation experiment.
+# Train a CFM (ResNet backbone) on the `triple_mixed` mock distribution
+# with no detector effects.
 
 defaults:
   - override /model: cfm
@@ -9,16 +13,15 @@ defaults:
 
 experiment:
   name: cfm_mock_gen
-  description: Base experiment for training with ResNet on CFM using MOCK.
+  description: CFM/ResNet trained on the mock triple_mixed distribution (generation task).
 
 mode: TRAIN
 predict: true
 predict_best_only: true
 save_samples: all
 
-
 trainer:
-  epochs: 800
+  epochs: 1000
   log_interval: 10
   val_interval: 10
 

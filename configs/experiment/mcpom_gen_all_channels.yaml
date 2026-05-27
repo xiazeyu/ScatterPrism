@@ -1,4 +1,8 @@
 # @package _global_
+#
+# MC-POM generation experiment (all channels).
+# Same as `mcpom_gen` but uses the `full_pom` transform: every raw channel
+# is fed to the model (no redundancy reduction).
 
 defaults:
   - override /model: cfm
@@ -9,7 +13,7 @@ defaults:
 
 experiment:
   name: cfm_mcpom_gen_all_channels
-  description: Base experiment for training with ResNet on CFM using MCPOM. All channels are used for training.
+  description: CFM/ResNet trained on MC-POM particle-level data with all channels (generation task).
 
 mode: TRAIN
 predict: true
@@ -17,7 +21,7 @@ predict_best_only: true
 save_samples: all
 
 trainer:
-  epochs: 800
+  epochs: 1000
   log_interval: 10
   val_interval: 10
 

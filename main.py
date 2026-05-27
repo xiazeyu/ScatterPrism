@@ -1,18 +1,53 @@
-import hydra
-from hydra.utils import instantiate
-from omegaconf import DictConfig, OmegaConf
-from pathlib import Path
+"""ScatterPrism entry-point: Hydra-driven train / predict / plot CLI.
+
+Run modes are selected via ``mode=...`` on the command line:
+
+    python main.py mode=TRAIN                [default]
+    python main.py mode=PREDICT              checkpoint_path=<run-dir-or-ckpt>
+    python main.py mode=BATCH_PREDICT        runs_dir=<multirun-dir>
+    python main.py mode=PLOT
+    python main.py mode=TEST_FLOW            checkpoint_path=<ckpt>
+    python main.py mode=CHECKPOINT_EVOLUTION checkpoint_path=<ckpt-or-run-dir>
+
+See ``configs/configs.py`` for the full structured-config schema and
+``configs/default.yaml`` for the default group selections.
+"""
+
+import importlib
 import logging
-import torch
+import multiprocessing
+import os
+import re
 import secrets
+import shutil
 import string
+import subprocess
+import time
+import traceback
+from pathlib import Path
 
+import hydra
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, RichProgressBar
+import numpy as np
+import torch
+import wandb
+import yaml
+from hydra.core.hydra_config import HydraConfig
+from hydra.utils import instantiate
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import WandbLogger
+from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import DataLoader
 
-from configs import configs
-from jetprism import schemas, utils
+# Imported for side-effect: registers structured configs into Hydra's ConfigStore.
+from configs import configs  # noqa: F401
+from scatterprism import schemas, utils
+from scatterprism.datasets import MCPom
+from scatterprism.metric import (
+    compute_joint_distribution_metrics,
+    compute_nn_memorization_metric,
+)
+from scatterprism.transforms import BaseTransform
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +76,7 @@ class CheckpointMetadataCallback(pl.Callback):
         checkpoint['dataset_name'] = self.dataset_name
         checkpoint['detector_name'] = self.detector_name
         if self.transform is not None:
-            checkpoint['transform_state'] = _serialize_transform(self.transform)
+            checkpoint['transform_state'] = self.transform.serialize()
 
 
 class EpochLoggerCallback(pl.Callback):
@@ -63,7 +98,6 @@ class FirstNEpochsCheckpoint(pl.Callback):
 
     def on_train_epoch_end(self, trainer, pl_module):
         if trainer.current_epoch < self.n:
-            import os
             os.makedirs(self.dirpath, exist_ok=True)
             filepath = os.path.join(self.dirpath, f"epoch_{trainer.current_epoch:03d}.ckpt")
             trainer.save_checkpoint(filepath)
@@ -77,7 +111,6 @@ class _CachedDataset:
     """
 
     def __init__(self, cache_path: str, paired: bool = False):
-        import numpy as np
         self.paired = paired
         self.data = None
         self.original_data = None
@@ -86,8 +119,14 @@ class _CachedDataset:
         self.data_dim = None
         self.load_cached_data(cache_path)
 
+    def __len__(self) -> int:
+        if self.paired and self.original_data is not None:
+            return len(self.original_data)
+        if self.data is not None:
+            return len(self.data)
+        return 0
+
     def load_cached_data(self, cache_path: str) -> None:
-        import numpy as np
         loaded = np.load(cache_path, allow_pickle=True)
         if 'data' in loaded:
             self.data = loaded['data']
@@ -103,8 +142,7 @@ class _CachedDataset:
 
 
 def _import_class(dotted_path: str):
-    """Import a class from a dotted path like 'jetprism.detectors.Identity'."""
-    import importlib
+    """Import a class from a dotted path like ``scatterprism.detectors.Identity``."""
     module_path, class_name = dotted_path.rsplit(".", 1)
     module = importlib.import_module(module_path)
     return getattr(module, class_name)
@@ -175,13 +213,10 @@ def _find_run_dirs(base: Path) -> list[Path]:
 
 
 def _regenerate_cache(run_dir: Path, project_root: Path, dry_run: bool = False) -> bool:
-    """Regenerate dataset_cache.npz for a single run directory.
+    """Regenerate ``dataset_cache.npz`` for a single run directory.
 
     Returns True if the cache was (re)generated, False otherwise.
     """
-    import time
-    import numpy as np
-
     config_path = run_dir / ".hydra" / "config.yaml"
     cache_path = run_dir / "dataset_cache.npz"
 
@@ -231,7 +266,6 @@ def main(cfg: DictConfig) -> None:
     # outputs directly into the existing experiment folder).
     _hydra_out: str | None = None
     try:
-        from hydra.core.hydra_config import HydraConfig
         _hydra_out = HydraConfig.get().runtime.output_dir
     except Exception:
         pass
@@ -240,9 +274,7 @@ def main(cfg: DictConfig) -> None:
         _main_impl(cfg)
     except Exception as e:
         log.error(f"Run failed with error: {e}")
-        # Re-raise only if not in multirun mode (single run should fail normally)
-        # In multirun mode, Hydra will continue to next run
-        import traceback
+        # In multirun mode, swallow so Hydra can continue to the next combo.
         log.error(traceback.format_exc())
         # Return instead of raising to allow multirun to continue
         return
@@ -259,7 +291,6 @@ def main(cfg: DictConfig) -> None:
             cfg.mode == schemas.Mode.BATCH_PREDICT and cfg.get('runs_dir') is not None
         )
         if _is_redirected and _hydra_out:
-            import shutil
             _hydra_out_path = Path(_hydra_out)
             if _hydra_out_path.exists():
                 shutil.rmtree(_hydra_out_path, ignore_errors=True)
@@ -279,8 +310,8 @@ def _main_impl(cfg: DictConfig) -> None:
     log.debug("Configuration loaded successfully")
     path = instantiate(cfg.path)
 
-    log.debug("Data and output directories:" + cfg.path.data_dir)
-    log.debug("Output directory:" + cfg.path.output_dir)
+    log.debug(f"Data directory: {cfg.path.data_dir}")
+    log.debug(f"Output directory: {cfg.path.output_dir}")
     log.debug("Instantiated configuration:")
     log.debug(cfg)
 
@@ -307,8 +338,13 @@ def _main_impl(cfg: DictConfig) -> None:
             output_dir = str(Path(runs_dir).resolve())
             log.info(f"Saving outputs to existing multirun directory: {output_dir}")
 
-    # Write a run summary file so each run directory is self-describing
-    _write_run_summary(cfg, output_dir)
+    # Write a run summary file so each run directory is self-describing.
+    # For PREDICT/BATCH_PREDICT we are reusing an existing training run dir;
+    # rewriting run_summary.yaml would clobber the wandb_id/wandb_url that
+    # training appended.  Skip the write — the file is already there and the
+    # later NN/joint-metric blocks append to it in-place.
+    if cfg.mode not in (schemas.Mode.PREDICT, schemas.Mode.BATCH_PREDICT):
+        _write_run_summary(cfg, output_dir)
 
     if cfg.mode == schemas.Mode.TRAIN:
         dataset = instantiate(cfg.dataset)
@@ -332,7 +368,6 @@ def _main_impl(cfg: DictConfig) -> None:
             detector_name = ckpt_meta.get('detector_name')
 
             # Check if user provided CLI overrides
-            from hydra.core.hydra_config import HydraConfig
             try:
                 cli_overrides = {ov.split('=')[0] for ov in HydraConfig.get().overrides.task}
             except Exception:
@@ -426,7 +461,42 @@ def _main_impl(cfg: DictConfig) -> None:
         # Batch predict all models in a multirun directory
         batch_predict(cfg, output_dir)
     elif cfg.mode == schemas.Mode.PLOT:
-        dataset = instantiate(cfg.dataset)
+        # If a checkpoint_path is supplied, restore dataset/detector/transform
+        # from the run's saved .hydra/config.yaml so the plot reflects exactly
+        # what the model saw. Otherwise the user-supplied (CLI) config wins;
+        # in that case the user must pick a transform compatible with the
+        # chosen dataset (e.g. transform=default_mock for synthetic datasets).
+        checkpoint_path_input = cfg.get('checkpoint_path')
+        if checkpoint_path_input is not None:
+            ckpt_or_dir = Path(checkpoint_path_input).resolve()
+            run_dir = ckpt_or_dir if ckpt_or_dir.is_dir() else ckpt_or_dir.parent
+            if run_dir.name == 'checkpoints':
+                run_dir = run_dir.parent
+            saved_config_path = run_dir / '.hydra' / 'config.yaml'
+            cache_file = run_dir / 'dataset_cache.npz'
+            if saved_config_path.exists():
+                saved_cfg = _resolve_saved_config(saved_config_path, Path(cfg.path.cwd))
+                cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+                cfg.dataset = OmegaConf.create(OmegaConf.to_container(saved_cfg.dataset, resolve=False))
+                if 'detector' in saved_cfg and saved_cfg.detector is not None:
+                    cfg.detector = OmegaConf.create(OmegaConf.to_container(saved_cfg.detector, resolve=False))
+                if 'transform' in saved_cfg and saved_cfg.transform is not None:
+                    cfg.transform = OmegaConf.create(OmegaConf.to_container(saved_cfg.transform, resolve=False))
+                log.info(f"PLOT: restored dataset/detector/transform from {saved_config_path}")
+                # Prefer the cached training arrays — bit-exact match to what the
+                # model saw and avoids the parquet/detector/transform pipeline.
+                if cache_file.exists():
+                    log.info(f"PLOT: loading dataset from cache {cache_file}")
+                    dataset = _CachedDataset(
+                        str(cache_file), paired=bool(cfg.dataset.get('paired', False)))
+                else:
+                    log.info("PLOT: no dataset cache — regenerating from saved seed")
+                    dataset = _instantiate_dataset_from_saved_config(cfg)
+            else:
+                log.warning(f"PLOT: checkpoint_path set but no saved config at {saved_config_path} — using CLI config")
+                dataset = instantiate(cfg.dataset)
+        else:
+            dataset = instantiate(cfg.dataset)
         plot(cfg, dataset, output_dir)
     elif cfg.mode == schemas.Mode.TEST_FLOW:
         # Visualise flow trajectory from a trained checkpoint
@@ -438,12 +508,13 @@ def _main_impl(cfg: DictConfig) -> None:
         checkpoint_evolution(cfg, output_dir)
 
 
-def train(cfg: DictConfig, dataset, output_dir: str) -> None:
-    """Training with PyTorch Lightning."""
-    from torch.utils.data import DataLoader
-    import wandb
-    import multiprocessing
-    
+def train(cfg: DictConfig, dataset, output_dir: str):
+    """Train a generative model with PyTorch Lightning.
+
+    Returns ``(model, trainer)`` after ``trainer.fit`` completes.  Writes the
+    final + best + periodic checkpoints, a ``run_summary.yaml`` with WandB
+    pointers, and (optionally) checkpoint-evolution plots into *output_dir*.
+    """
     log.info("Starting training process")
     
     # Get data splits
@@ -488,7 +559,6 @@ def train(cfg: DictConfig, dataset, output_dir: str) -> None:
     log.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Get the Hydra dataset / model / detector choice names for logging and checkpoint metadata
-    from hydra.core.hydra_config import HydraConfig
     hydra_cfg = HydraConfig.get()
     dataset_name = hydra_cfg.runtime.choices.get('dataset', cfg.dataset._target_.split('.')[-1])
     model_name = hydra_cfg.runtime.choices.get('model', cfg.model._target_.split('.')[-1])
@@ -571,7 +641,7 @@ def train(cfg: DictConfig, dataset, output_dir: str) -> None:
     wandb_config['output_dir'] = str(output_dir)
 
     logger = WandbLogger(
-        project="jetprism",
+        project="scatterprism",
         name=wandb_display_name,
         id=wandb_id,
         tags=[model_name, dataset_name],
@@ -610,7 +680,6 @@ def train(cfg: DictConfig, dataset, output_dir: str) -> None:
     # Use the best checkpoint (by val/chi2_mean) as final_model.ckpt.
     # Fall back to last.ckpt if no best checkpoint exists (e.g. validation was disabled).
     final_path = f"{output_dir}/final_model.ckpt"
-    import shutil
     best_ckpt_path = best_checkpoint.best_model_path
     if best_ckpt_path and Path(best_ckpt_path).exists():
         shutil.copy(best_ckpt_path, final_path)
@@ -621,8 +690,7 @@ def train(cfg: DictConfig, dataset, output_dir: str) -> None:
 
     # Upload only the final checkpoint to wandb as an artifact.
     # All intermediate checkpoints are already on disk in outputs/checkpoints/.
-    import wandb as _wandb
-    artifact = _wandb.Artifact(
+    artifact = wandb.Artifact(
         name=f"model-{wandb_id}",
         type="model",
         description=f"{wandb_display_name} | {output_dir}",
@@ -632,7 +700,6 @@ def train(cfg: DictConfig, dataset, output_dir: str) -> None:
     log.info("Final checkpoint uploaded to wandb as artifact.")
 
     # Append wandb tracing info to run_summary so disk→wandb lookup is trivial.
-    import os
     summary_path = os.path.join(output_dir, 'run_summary.yaml')
     with open(summary_path, 'a') as _f:
         _f.write(f"wandb_id: {wandb_id}\n")
@@ -659,10 +726,7 @@ def train(cfg: DictConfig, dataset, output_dir: str) -> None:
 
 
 def _write_run_summary(cfg: DictConfig, output_dir: str) -> None:
-    """Write a run_summary.yaml into the output directory for quick identification."""
-    import os
-    from hydra.core.hydra_config import HydraConfig
-
+    """Write a ``run_summary.yaml`` into the output directory for quick identification."""
     try:
         hydra_cfg = HydraConfig.get()
         choices = dict(hydra_cfg.runtime.choices)
@@ -704,8 +768,11 @@ def _write_run_summary(cfg: DictConfig, output_dir: str) -> None:
                 except Exception as e:
                     log.debug(f"Could not load saved config for summary: {e}")
 
+    # cfg.mode is a schemas.Mode enum; persist the .value (e.g. "train") so the
+    # YAML is round-trippable as a plain string rather than "Mode.TRAIN".
+    mode_value = cfg.mode.value if hasattr(cfg.mode, 'value') else str(cfg.mode)
     summary = {
-        'mode': str(cfg.mode),
+        'mode': mode_value,
         'model': choices.get('model', OmegaConf.select(cfg, 'model._target_', default='unknown')),
         'dataset': choices.get('dataset', OmegaConf.select(cfg, 'dataset._target_', default='unknown')),
         'detector': choices.get('detector', None),
@@ -721,17 +788,6 @@ def _write_run_summary(cfg: DictConfig, output_dir: str) -> None:
         for key, value in summary.items():
             f.write(f"{key}: {value}\n")
     log.info(f"Run summary: {summary}")
-
-
-def _serialize_transform(transform):
-    """Serialize transform to a dictionary for checkpoint storage."""
-    return transform.serialize()
-
-
-def _deserialize_transform(state):
-    """Deserialize transform from checkpoint."""
-    from jetprism.transforms import BaseTransform
-    return BaseTransform.deserialize(state)
 
 
 def _load_checkpoint_config_overrides(checkpoint_path: str, device: str = 'cpu') -> dict:
@@ -759,7 +815,6 @@ def _resolve_run_dir_and_checkpoint(path_str: str) -> tuple:
         checkpoint to load model metadata from (prefers best.ckpt > last.ckpt
         > final_model.ckpt > latest epoch_*.ckpt).
     """
-    import re
     p = Path(path_str).resolve()
 
     if p.is_file():
@@ -812,8 +867,6 @@ def _find_prediction_checkpoints(path_str: str) -> list:
     runs (only ``epoch_*.ckpt`` + ``best.ckpt``). For partial runs, the highest
     epoch checkpoint is treated as the "last" checkpoint.
     """
-    import re
-
     run_dir, _ = _resolve_run_dir_and_checkpoint(path_str)
     ckpts_dir = run_dir / 'checkpoints'
     if not ckpts_dir.is_dir():
@@ -891,16 +944,15 @@ def _predict_single(
     transform, dataset, device, n_generate, batch_size,
     dataset_name, truth_data, save_samples: bool = False,
 ):
-    """Load model from *ckpt_path*, generate samples, and save plots with *suffix*.
+    """Load *ckpt_path*, generate samples, and save plots with *suffix*.
 
     Args:
-        save_samples: If True, save generated_samples_{suffix}.npz. Default False
-                      to save disk space. Set to True to save raw samples.
+        save_samples: If True, save ``generated_samples_{suffix}.npz``.
+            Default False to save disk space (~1 GB per file at full size).
 
-    Returns ``(samples_physical, samples_transformed)`` numpy arrays.
+    Returns:
+        ``(samples_physical, samples_transformed)`` numpy arrays.
     """
-    import numpy as np
-
     log.info(f"Loading model from: {ckpt_path}")
     model = model_cls.load_from_checkpoint(ckpt_path, weights_only=False, **model_overrides)
     model.eval()
@@ -986,7 +1038,7 @@ def _predict_single(
             'Generated': samples,
         }
         if is_mcpom:
-            utils.plot_distributions_multiple_v0(
+            utils.plot_distributions_multiple_mcpom(
                 comparison,
                 f"{output_dir}/distributions_comparison_{suffix}.png",
             )
@@ -998,7 +1050,7 @@ def _predict_single(
         log.info(f"Saved comparison plot: distributions_comparison_{suffix}.png")
     else:
         if is_mcpom:
-            utils.plot_distributions_v0(
+            utils.plot_distributions_mcpom(
                 samples,
                 f"{output_dir}/generated_distribution_{suffix}.png",
             )
@@ -1010,7 +1062,7 @@ def _predict_single(
     if truth_data is not None:
         diff_path = f"{output_dir}/distributions_diff_{suffix}.png"
         if is_mcpom:
-            utils.plot_distributions_diff_v0(
+            utils.plot_distributions_diff_mcpom(
                 truth_data, samples, diff_path,
                 label_a='Truth', label_b='Generated',
             )
@@ -1041,8 +1093,6 @@ def predict(cfg: DictConfig, dataset, output_dir: str) -> None:
     are suffixed accordingly, e.g. ``generated_distribution_best.png``,
     ``distributions_diff_400.png``.
     """
-    import numpy as np
-
     log.info("Starting prediction process")
 
     # ── Common setup ──────────────────────────────────────────────────────────
@@ -1078,7 +1128,7 @@ def predict(cfg: DictConfig, dataset, output_dir: str) -> None:
     # Load transform from checkpoint
     transform = None
     if 'transform_state' in checkpoint:
-        transform = _deserialize_transform(checkpoint['transform_state'])
+        transform = BaseTransform.deserialize(checkpoint['transform_state'])
         if transform is not None:
             log.info("Loaded transform from checkpoint")
         else:
@@ -1102,9 +1152,10 @@ def predict(cfg: DictConfig, dataset, output_dir: str) -> None:
     batch_size = cfg.generation_batch_size
 
     # ── Load truth data (once) ────────────────────────────────────────────────
+    # ``cache_path`` was defined above when locating the cached training
+    # dataset; reuse it here rather than rebuilding the same Path.
     _truth_for_analysis = None
     _loaded_cache = None
-    cache_path = run_dir / 'dataset_cache.npz'
     if cache_path.exists():
         loaded = np.load(str(cache_path), allow_pickle=True)
         if 'pre_transform_data' in loaded:
@@ -1217,9 +1268,14 @@ def predict(cfg: DictConfig, dataset, output_dir: str) -> None:
     # If D_gen ≈ D_train the model generalises; D_gen ≪ D_train signals memorisation.
     if cfg.compute_nn and _loaded_cache is not None and 'data' in _loaded_cache:
         try:
-            from jetprism.metric import compute_nn_memorization_metric
-
-            training_transformed_data = _loaded_cache['data']  # [N_train, D]
+            # Restrict the NN reference to the actual training partition so
+            # R_NN measures memorisation of training events, not the full
+            # (train+val+test) cached manifold.
+            training_transformed_data = _loaded_cache['data']  # [N_total, D]
+            _train_idx = utils.reproduce_train_indices(
+                run_dir, len(training_transformed_data)
+            )
+            training_transformed_data = training_transformed_data[_train_idx]
             log.info(
                 f"Computing NN memorization metric (this may take a while): "
                 f"nn_sample_size={cfg.nn_sample_size}, "
@@ -1249,9 +1305,6 @@ def predict(cfg: DictConfig, dataset, output_dir: str) -> None:
             # predict() runs outside the pl.Trainer context, so we locate the
             # training run's summary file and resume its WandB run directly.
             try:
-                import wandb as _wandb
-                import yaml as _yaml
-
                 # Find run_summary.yaml written at end of training.
                 _summary_path = run_dir / 'run_summary.yaml'
                 if not _summary_path.exists():
@@ -1274,7 +1327,7 @@ def predict(cfg: DictConfig, dataset, output_dir: str) -> None:
                 _wandb_id = None
                 if _summary_path is not None:
                     with open(_summary_path) as _f2:
-                        _summary = _yaml.safe_load(_f2)
+                        _summary = yaml.safe_load(_f2)
                     _wandb_id = _summary.get('wandb_id')
 
                 if _wandb_id:
@@ -1285,7 +1338,7 @@ def predict(cfg: DictConfig, dataset, output_dir: str) -> None:
                     # URL format: https://wandb.ai/<entity>/<project>/runs/<id>
                     _w_entity  = _url_parts[3] if len(_url_parts) >= 7 else None
                     _w_project = _url_parts[4] if len(_url_parts) >= 7 else None
-                    _wandb_run = _wandb.init(
+                    _wandb_run = wandb.init(
                         id=_wandb_id,
                         entity=_w_entity,
                         project=_w_project,
@@ -1313,7 +1366,6 @@ def predict(cfg: DictConfig, dataset, output_dir: str) -> None:
                 log.warning(f"NN results persistence failed (non-fatal): {_we}")
         except Exception as e:
             log.error(f"NN memorization metric failed (non-fatal): {e}")
-            import traceback
             log.error(traceback.format_exc())
     elif cfg.compute_nn:
         log.warning(
@@ -1326,18 +1378,33 @@ def predict(cfg: DictConfig, dataset, output_dir: str) -> None:
     #   correlation_distance : Frobenius ||corr(truth) - corr(gen)||
     #   covariance_distance  : Frobenius ||cov(truth) - cov(gen)||
     #   chi2_2d_mean         : mean 2-D binned chi2 over all feature pairs
+    # Truth and generated samples are both sliced to the held-out test split
+    # so the metric reflects generalisation, not in-sample fit. Paired
+    # (denoise/unfold) runs preserve 1-to-1 ordering so both arrays use the
+    # same test indices; unpaired generation samples are i.i.d. from noise so
+    # we trim them to match the test-truth length.
     if _truth_for_analysis is not None and samples.ndim == 2 and samples.shape[1] > 1:
         try:
-            from jetprism.metric import compute_joint_distribution_metrics
-
             log.info("Computing joint distribution metrics ...")
+            _is_paired_joint = (
+                _loaded_cache is not None and 'detector_data' in _loaded_cache.files
+            )
+            _test_idx_joint = utils.reproduce_test_indices(
+                run_dir, len(_truth_for_analysis)
+            )
+            _truth_test = _truth_for_analysis[_test_idx_joint]
+            if _is_paired_joint and len(samples) == len(_truth_for_analysis):
+                _samples_test = samples[_test_idx_joint]
+            else:
+                _n = min(len(_truth_test), len(samples))
+                _truth_test = _truth_test[:_n]
+                _samples_test = samples[:_n]
             joint_results = compute_joint_distribution_metrics(
-                truth=_truth_for_analysis[:len(samples)],
-                generated=samples,
+                truth=_truth_test,
+                generated=_samples_test,
             )
 
             # Append to run_summary.yaml
-            import os, yaml as _yaml
             _summary_path = run_dir / 'run_summary.yaml'
             if _summary_path.exists():
                 with open(_summary_path, 'a') as _sf:
@@ -1348,7 +1415,6 @@ def predict(cfg: DictConfig, dataset, output_dir: str) -> None:
 
         except Exception as e:
             log.error(f"Joint distribution metrics failed (non-fatal): {e}")
-            import traceback
             log.error(traceback.format_exc())
     elif _truth_for_analysis is None:
         log.warning(
@@ -1357,25 +1423,17 @@ def predict(cfg: DictConfig, dataset, output_dir: str) -> None:
 
 
 def batch_predict(cfg: DictConfig, output_dir: str) -> None:
-    """Submit SLURM jobs to predict all models in a multirun directory.
-    
+    """Submit one SLURM PREDICT job per run directory under ``cfg.runs_dir``.
+
+    Each sub-run must contain a recognisable checkpoint:
+      - ``checkpoints/best.ckpt`` or ``checkpoints/last.ckpt``
+      - ``final_model.ckpt``
+      - ``checkpoints/epoch_*.ckpt``
+
     Usage:
         python main.py mode=BATCH_PREDICT runs_dir=outputs/2026-03-13
         python main.py mode=BATCH_PREDICT runs_dir=outputs/2026-03-13 dry_run=true
-    
-    Finds all run directories under runs_dir that contain checkpoints and submits
-    a separate SLURM job for each via slurm_submit.py. Jobs run in parallel.
-    
-    A valid run directory must contain either:
-      - checkpoints/best.ckpt or checkpoints/last.ckpt
-      - final_model.ckpt
-      - checkpoints/epoch_*.ckpt
-    
-    Config options:
-      - dry_run: If true, print commands without submitting (default: false)
     """
-    import subprocess
-    
     runs_dir = cfg.runs_dir
     if runs_dir is None:
         log.error("runs_dir must be specified for BATCH_PREDICT mode")
@@ -1417,11 +1475,13 @@ def batch_predict(cfg: DictConfig, output_dir: str) -> None:
     
     # Forward all user-provided CLI overrides to each sub-task, except for
     # BATCH_PREDICT-specific keys (mode, runs_dir, dry_run).
-    from hydra.core.hydra_config import HydraConfig
+    # Strip any Hydra prefix (`+` add / `~` remove / `++` force) before
+    # comparing, otherwise `+dry_run=true` would slip through and be sent
+    # to every PREDICT sub-task as an unknown key.
     _batch_only_keys = {'mode', 'runs_dir', 'dry_run'}
     extra_overrides: list[str] = [
         ov for ov in HydraConfig.get().overrides.task
-        if ov.split('=', 1)[0] not in _batch_only_keys
+        if ov.split('=', 1)[0].lstrip('+~') not in _batch_only_keys
     ]
     if extra_overrides:
         log.info(f"Forwarding overrides to sub-tasks: {extra_overrides}")
@@ -1456,26 +1516,33 @@ def batch_predict(cfg: DictConfig, output_dir: str) -> None:
 
 
 def plot(cfg: DictConfig, dataset, output_dir: str) -> None:
-    """Plot dataset distribution.
+    """Plot the dataset's marginal distribution(s).
 
     For MCPom datasets (24-column physics data), plots all channels in a 6×4
-    panel via ``plot_distributions_v0``.  For other datasets, falls back to the
-    flattened 1-D histogram.
+    panel via :func:`utils.plot_distributions_mcpom`.  For other datasets,
+    falls back to a flattened 1-D histogram.
     """
     log.info("Starting plot process")
-    
-    from hydra.core.hydra_config import HydraConfig
+
     hydra_cfg = HydraConfig.get()
-    dataset_name = hydra_cfg.runtime.choices.get('dataset', cfg.dataset._target_.split('.')[-1])
-    
-    import os
-    from jetprism.datasets import MCPom
-    if isinstance(dataset, MCPom):
+    # Prefer the actual dataset class — when PLOT auto-restored from a
+    # checkpoint, runtime.choices.dataset still reflects the CLI invocation
+    # (e.g. the default "single_mcpom") rather than the restored dataset.
+    choice_name = hydra_cfg.runtime.choices.get('dataset')
+    target_leaf = cfg.dataset._target_.split('.')[-1].lower()
+    dataset_name = choice_name if (
+        choice_name and target_leaf in choice_name.lower()
+    ) else target_leaf
+
+    # Target-string check (not isinstance) so cache-wrapped datasets are
+    # routed to the 24-channel MC-POM plot too.
+    is_mcpom = cfg.dataset._target_.endswith('.MCPom')
+    if is_mcpom:
         # Use pre-transform (physical-unit) data when available
         data = dataset.pre_transform_data if dataset.pre_transform_data is not None else dataset.data
         filepath = os.path.join(output_dir, f'{dataset_name}_distribution.png')
         os.makedirs(output_dir, exist_ok=True)
-        utils.plot_distributions_v0(data, filepath)
+        utils.plot_distributions_mcpom(data, filepath)
         log.info(f"Saved 24-channel MC-POM plot to: {filepath}")
     else:
         utils.plot_flatten_dataset_distribution(dataset, output_dir, dataset_name)
@@ -1588,7 +1655,6 @@ def checkpoint_evolution(cfg: DictConfig, output_dir: str) -> None:
                 )
             except Exception as e:
                 log.error(f"Failed for {job_dir.name}: {e}")
-                import traceback
                 log.error(traceback.format_exc())
     else:
         # Single run mode: locate run directory from checkpoint_path
@@ -1614,17 +1680,4 @@ def checkpoint_evolution(cfg: DictConfig, output_dir: str) -> None:
 
 
 if __name__ == "__main__":
-    # Example: Train CFM on gaussian dataset
-    # import sys
-    # sys.argv = ['main.py', 'mode=TRAIN', 'model=cfm', 'dataset=gaussian']
-    
-    # Example: Multi-run sweep
-    # sys.argv = ['main.py', '-m', 'model=cfm,ddpm', 'dataset=gaussian,highcut']
-    
-    # Example: Use experiment config
-    # sys.argv = ['main.py', '+experiment=train_cfm']
-    
-    # Example: Predict
-    # sys.argv = ['main.py', 'mode=PREDICT', 'dataset=highfreq_a']
-
     main()

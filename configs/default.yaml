@@ -1,3 +1,7 @@
+# Root config — sets the default group selections for every run.
+# Override any group from the CLI, e.g. `dataset=gauss_standard`,
+# or load a full preset with `+experiment=mock_gen`.
+
 defaults:
   - base_config
   - path: default

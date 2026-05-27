@@ -1,9 +1,9 @@
 cff-version: 1.2.0
-title: JetPrism
+title: ScatterPrism
 type: software
-version: 0.1.0
+version: 0.1.1
 license: MIT
-repository-code: https://github.com/xiazeyu/JetPrism
+repository-code: https://github.com/xiazeyu/ScatterPrism
 doi: "10.48550/arXiv.2604.01313"
 url: "https://doi.org/10.48550/arXiv.2604.01313"
 authors:
@@ -38,5 +38,5 @@ identifiers:
     value: "10.5281/zenodo.19364484"
     description: "Software archive on Zenodo"
   - type: doi
-    value: "10.5281/zenodo.19277778"
+    value: "10.5281/zenodo.19277777"
     description: "Dataset and pre-trained checkpoints on Zenodo"

@@ -1,21 +1,42 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
-Generate publication-quality PDF figure showing failure modes and limitations
-of flow matching models.
+Common flow-matching failure modes — Figure 13 (Appendix C).
 
-This script creates a two-panel figure demonstrating:
-1. Underfitting: spurious modes and missing peaks (from early checkpoints)
-2. Boundary smearing: intrinsic error in FM near sharp cutoffs
+Two-panel didactic figure illustrating typical CFM artefacts before full
+convergence:
+
+  (a) Underfitting artefacts — spurious sharp spikes, blended/smeared peaks.
+  (b) Boundary smearing      — intrinsic CFM leakage past hard kinematic cuts.
+
+By default the panels are produced from FIXED synthetic distributions so the
+figure is fully reproducible and decoupled from any training run. The
+``--underfitting-run`` and ``--smearing-run`` options allow regenerating the
+same panels from an actual early-stopped checkpoint.
+
+Inputs:
+    None (synthetic mode, default).
+    Optional: <run_dir>/dataset_cache.npz + generated_samples_<epoch>.npz
+              when ``--underfitting-run`` / ``--smearing-run`` are given.
+
+Outputs:
+    <output> (default: figures/failure_modes.pdf)
 
 Usage:
-    python scripts/plot_failure_modes.py --output figures/failure_modes.pdf
+    python scripts/6_failure_modes.py [--output figures/failure_modes.pdf]
 
-Options:
-    --underfitting-run: Path to run directory with underfitting example
-    --underfitting-epoch: Epoch number for early checkpoint (default: 9)
-    --smearing-run: Path to run directory with smearing example  
-    --output: Output PDF path (default: figures/failure_modes.pdf)
-    --synthetic: Generate synthetic examples instead of loading from runs
+Examples:
+    # Reproduce Figure 13 from synthetic exemplars (default)
+    python scripts/6_failure_modes.py --output figures/failure_modes.pdf
+
+    # Regenerate from a real early-epoch checkpoint
+    python scripts/6_failure_modes.py \\
+        --underfitting-run outputs/generation/mock/triple_mixed_scale_5 \\
+        --underfitting-epoch 9
+
+Notes:
+    These exemplars are illustrative only — they are deliberately produced
+    from fixed deterministic synthetic distributions and do not depend on
+    any train/val/test split.
 """
 
 import argparse
@@ -32,13 +53,9 @@ import matplotlib.patheffects as path_effects
 # Add parent directory for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# ============================================================
-# Unified CVD-safe color palette for all JetPrism figures
-# ============================================================
-COLOR_TRUTH = '#0072B2'       # Blue - reference/truth data
-COLOR_GENERATED = '#E69F00'   # Orange/amber - model output
-COLOR_GEN_FILL = '#F5C97A'    # Lighter orange for fills
-COLOR_CONTEXT = '#808080'     # Medium gray - reference lines/grid
+from scatterprism.utils import (  # noqa: E402
+    COLOR_TRUTH, COLOR_GENERATED, COLOR_GEN_FILL, COLOR_CONTEXT,
+)
 
 # ============================================================
 # JINST-compatible Matplotlib settings
@@ -499,16 +516,17 @@ def main():
         epilog="""
 Examples:
     # Generate figure with synthetic examples
-    python scripts/plot_failure_modes.py --synthetic --output figures/failure_modes.pdf
-    
-    # Use data from actual runs
-    python scripts/plot_failure_modes.py \\
-        --underfitting-run outputs/2026-03-16/03-33-32_2fvsg67g \\
+    python scripts/6_failure_modes.py --synthetic --output figures/failure_modes.pdf
+
+    # Use data from an actual run
+    python scripts/6_failure_modes.py \\
+        --underfitting-run outputs/generation/mock/triple_mixed_scale_5 \\
         --underfitting-epoch 9 \\
         --output figures/failure_modes.pdf
-        
+
     # Three-panel layout
-    python scripts/plot_failure_modes.py --synthetic --three-panel --output figures/failure_modes_3panel.pdf
+    python scripts/6_failure_modes.py --synthetic --three-panel \\
+        --output figures/failure_modes_3panel.pdf
 """
     )
     

@@ -1,8 +1,10 @@
+# Mock-data transform: standard scaling only (auto-fitted mean/std, scale-factor 5).
+
 defaults:
   - compose
 
 transforms:
-  - _target_: jetprism.transforms.StandardScaler
+  - _target_: scatterprism.transforms.StandardScaler
     mean: null
     std: null
     scale: 5.0

@@ -1,4 +1,4 @@
-# Uniform on [-2, 2] — flat distribution, no peaks
+# Uniform U(-2, 2) — flat distribution, no peaks.
 
 defaults:
   - uniform

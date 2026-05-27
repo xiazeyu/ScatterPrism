@@ -1,8 +1,17 @@
+"""Distribution-quality and memorization metrics for ScatterPrism.
+
+Provides:
+    * Per-feature distribution metrics (chi², KS, Wasserstein).
+    * Joint distribution metrics (correlation/covariance Frobenius distance,
+      pairwise 2-D chi²).
+    * Nearest-neighbour memorization diagnostics.
+    * A tiny wall-clock :class:`Timer` and a parameter counter for models.
+"""
+
 from dataclasses import dataclass
 import logging
 import numpy as np
 import time
-from typing import Dict
 
 import torch
 
@@ -10,28 +19,33 @@ log = logging.getLogger(__name__)
 
 
 def extract_feature(data: np.ndarray, feature_index: int) -> np.ndarray:
-    """
-    Extracts a specific feature column from the dataset.
+    """Return a single feature column from ``data``.
 
     Args:
-        data (np.array): The dataset from which to extract the feature.
-        feature_index (int): The index of the feature to extract.
+        data:           Dataset of shape ``[N, D]``.
+        feature_index:  Column index to extract.
 
     Returns:
-        np.array: The extracted feature column.
+        Numpy array of shape ``[N]``.
     """
     return data[:, feature_index]
 
 
-def chi2_metric(expected: np.ndarray, observed: np.ndarray, n_bins: int = 50):
-    """
-    Calculates the Chi-squared metric between two distributions.
+def chi2_metric(expected: np.ndarray, observed: np.ndarray, n_bins: int = 50) -> float:
+    """Binned chi-squared distance between two 1-D distributions.
 
-    Bins are defined by the range of *expected* (truth).  Any *observed*
-    (generated) events that fall outside this range are implicitly captured
-    by re-normalising the observed histogram to the same total count as the
-    expected histogram before computing the statistic.  This prevents
-    out-of-range generated samples from spuriously inflating chi2.
+    Bins are defined by the range of *expected* (truth).  The *observed*
+    histogram is re-normalised to the same total count as *expected* before
+    computing the statistic, so generated events landing outside the truth
+    range do not bias the result.
+
+    Args:
+        expected: Truth samples (1-D array).
+        observed: Generated samples (1-D array).
+        n_bins:   Number of histogram bins (default 50).
+
+    Returns:
+        Chi-squared statistic over all non-empty truth bins.
     """
 
     bin_min = np.min(expected)
@@ -42,72 +56,51 @@ def chi2_metric(expected: np.ndarray, observed: np.ndarray, n_bins: int = 50):
     hist_expected, _ = np.histogram(expected, bins=bins)
     hist_observed, _ = np.histogram(observed, bins=bins)
 
-    E = np.array(hist_expected, dtype=float)
-    O = np.array(hist_observed, dtype=float)
+    E = np.asarray(hist_expected, dtype=float)
+    O = np.asarray(hist_observed, dtype=float)
 
-    # Re-normalise O to the same total as E so that generated events
-    # landing outside the truth range do not bias the statistic.
-    obs_total = O.sum()
-    exp_total = E.sum()
+    obs_total, exp_total = O.sum(), E.sum()
     if obs_total > 0 and exp_total > 0:
         O = O * (exp_total / obs_total)
 
-    non_zero_mask = (E > 0)
-
-    O_safe = O[non_zero_mask]
-    E_safe = E[non_zero_mask]
-
-    terms = (O_safe - E_safe)**2 / E_safe
-
-    chi_squared_value = np.sum(terms)
-
-    return chi_squared_value
+    mask = E > 0
+    return float(np.sum((O[mask] - E[mask]) ** 2 / E[mask]))
 
 
 @dataclass
 class Timer:
-    """
-    A simple timer class to measure wall-clock time.
+    """Simple wall-clock timer with CUDA-sync support.
+
+    ``start()``/``stop()`` synchronise CUDA streams (if available) so the
+    measurement covers GPU work as well as host code.
     """
 
-    start_time: float | None
-    end_time: float | None
+    start_time: float | None = None
+    end_time: float | None = None
 
-    def start(self):
+    def start(self) -> None:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         self.start_time = time.perf_counter()
 
-    def stop(self):
+    def stop(self) -> None:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         self.end_time = time.perf_counter()
 
     def elapsed(self) -> float:
         if self.start_time is None or self.end_time is None:
-            raise ValueError(
-                "Timer has not been started and stopped properly.")
+            raise ValueError("Timer has not been started and stopped properly.")
         return self.end_time - self.start_time
 
 
 def num_params(model: torch.nn.Module) -> int:
-    """
-    Returns the total number of trainable parameters in a PyTorch model.
-    """
+    """Return the total number of trainable parameters in *model*."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def momentum_residuals(momentum_orig: np.ndarray, momentum_test: np.ndarray) -> np.ndarray:
-    """
-    Calculates the residuals between two momentum distributions.
-
-    Args:
-        momentum_orig (np.array): The truth momentum dataset.
-        momentum_test (np.array): The test momentum dataset.
-
-    Returns:
-        np.array: The residuals (momentum_orig - momentum_test).
-    """
+    """Return the element-wise residuals ``momentum_orig - momentum_test``."""
     return momentum_orig - momentum_test
 
 
@@ -175,7 +168,7 @@ def compute_nn_memorization_metric(
     ref_batch_size: int = 50_000,
     device: torch.device | str | None = None,
     rng_seed: int = 42,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     """Nearest-Neighbor memorization diagnostic.
 
     Computes two distance statistics that together indicate whether the generative
@@ -367,7 +360,7 @@ def pairwise_chi2_2d(
     truth: np.ndarray,
     generated: np.ndarray,
     n_bins: int = 20,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     """Compute 2-D chi-squared for all unique feature pairs.
 
     Returns a dict with ``chi2_2d_mean`` and per-pair values keyed as
@@ -402,7 +395,7 @@ def compute_joint_distribution_metrics(
     truth: np.ndarray,
     generated: np.ndarray,
     n_bins_2d: int = 20,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     """Compute all joint distribution quality metrics.
 
     Combines correlation matrix distance, covariance distance, and pairwise
@@ -416,7 +409,7 @@ def compute_joint_distribution_metrics(
     Returns:
         Dictionary with all joint distribution metrics.
     """
-    results: Dict[str, float] = {}
+    results: dict[str, float] = {}
 
     results["correlation_distance"] = correlation_matrix_distance(truth, generated)
     results["covariance_distance"] = covariance_frobenius_distance(truth, generated)

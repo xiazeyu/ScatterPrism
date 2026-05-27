@@ -1,23 +1,47 @@
+"""Dataset classes for ScatterPrism.
+
+Provides the :class:`BaseDataset` abstraction (detector + transform pipeline
+shared by all concrete datasets), an :class:`MCPom` loader for the real
+physics parquet file, and a family of :class:`Synthetic` distributions used
+for unit-style validation of the generative models.
+"""
+
 from abc import ABCMeta
 from dataclasses import dataclass, field
+import logging
+import os
+
 from hepunits.units import GeV
 from omegaconf import MISSING
 from torch.utils.data import Dataset, Subset, random_split
-import logging
 import numpy as np
-import os
 import pandas as pd
 import torch
 
-
-from jetprism.detectors import BaseDetector
-from jetprism.transforms import BaseTransform
+from scatterprism.detectors import BaseDetector
+from scatterprism.transforms import BaseTransform
 
 log = logging.getLogger(__name__)
 
 
 @dataclass
 class BaseDataset(Dataset, metaclass=ABCMeta):
+    """Common dataset base wrapping a detector + transform pipeline.
+
+    Concrete subclasses populate a raw :class:`pandas.DataFrame` and call
+    :meth:`_setup_data_from_df` to apply the optional detector and transform
+    and produce the numpy arrays consumed by training.
+
+    Attributes:
+        paired: When True, ``__getitem__`` returns ``(original, detector)``
+            tensor pairs and ``original_data`` / ``detector_data`` are
+            populated.  When False, only ``data`` is populated.
+        data:               Final (transformed) data, only set in unpaired mode.
+        original_data:      Particle-level data (paired mode).
+        detector_data:      Detector-level data (paired mode).
+        pre_transform_data: Copy of the data before the transform was applied;
+            used for physical-units plotting/metrics.
+    """
 
     batch_size: int = MISSING
     shuffle: bool = MISSING
@@ -60,14 +84,19 @@ class BaseDataset(Dataset, metaclass=ABCMeta):
         val_size = int(split_ratios[1] * total_size)
         test_size = total_size - train_size - val_size
 
+        # ``None`` ⇒ non-deterministic: ``Generator.seed()`` self-seeds from
+        # std::random_device (``manual_seed`` rejects ``None``).
+        rng = torch.Generator()
+        if self.random_seed is None:
+            rng.seed()
+        else:
+            rng.manual_seed(self.random_seed)
+
         if val_size == 0 and test_size == 0:
             # No holdout: train on the full dataset.
             # Build a small random validation subset (capped at 50 000 events) so
             # that distribution metrics (chi2, KS, Wasserstein) remain fast and the
             # val-data buffer does not bloat RAM.
-            rng = torch.Generator().manual_seed(
-                self.random_seed if self.random_seed is not None else 42
-            )
             val_cap = min(total_size, 50_000)
             perm = torch.randperm(total_size, generator=rng)
             train_set = Subset(self, list(range(total_size)))
@@ -79,8 +108,8 @@ class BaseDataset(Dataset, metaclass=ABCMeta):
             )
             return train_set, val_set, test_set
 
-        train_set, val_set, test_set = random_split(self, [train_size, val_size, test_size], generator=torch.Generator(
-        ).manual_seed(self.random_seed if self.random_seed is not None else 42))
+        train_set, val_set, test_set = random_split(
+            self, [train_size, val_size, test_size], generator=rng)
         return train_set, val_set, test_set
 
     def save_data(self, save_dir: str) -> str:
@@ -242,6 +271,7 @@ class BaseDataset(Dataset, metaclass=ABCMeta):
 
 @dataclass
 class MCPom(BaseDataset):
+    """The MC Pomeron γ p → p π⁺ π⁻ dataset (24-column parquet)."""
 
     file_name: str = MISSING
     sample_num: int | None = MISSING
@@ -286,7 +316,7 @@ class MCPom(BaseDataset):
             raise FileNotFoundError(
                 f"Dataset file not found: {self.filepath}\n"
                 "Please download 'mc_pom_v2.parquet' from "
-                "https://doi.org/10.5281/zenodo.19277778 "
+                "https://doi.org/10.5281/zenodo.19277777 "
                 "and place it under data/mc_pom_v2.parquet"
             )
 
@@ -303,6 +333,12 @@ class MCPom(BaseDataset):
 
 @dataclass
 class Synthetic(BaseDataset):
+    """Abstract base for synthetically generated datasets.
+
+    Subclasses override :meth:`generate_data` to return a numpy array of
+    shape ``(sample_num, dim)``.
+    """
+
     sample_num: int = MISSING
     dim: int = MISSING
 
@@ -337,6 +373,8 @@ class Synthetic(BaseDataset):
 
 @dataclass
 class Gaussian(Synthetic):
+    """Plain ``N(mean, std)`` distribution."""
+
     mean: float = MISSING
     std: float = MISSING
 
@@ -347,6 +385,12 @@ class Gaussian(Synthetic):
 
 @dataclass
 class HighCut(Synthetic):
+    """Gaussian with a hard upper cutoff at ``threshold`` (per-dim AND).
+
+    ``buffer_multiplier`` over-samples the raw Gaussian before rejection
+    sampling so that, after the cut, at least ``sample_num`` events remain.
+    """
+
     mean: float = MISSING
     std: float = MISSING
     threshold: float = MISSING
@@ -354,59 +398,54 @@ class HighCut(Synthetic):
 
     def generate_data(self) -> np.ndarray:
         rng = np.random.default_rng(self.random_seed)
-
-        # Generate extra samples to account for filtering
-        raw = rng.normal(loc=self.mean, scale=self.std, size=(
-            int(self.sample_num * self.buffer_multiplier), self.dim))
-
-        # Filter: Keep only values where ALL dimensions are below threshold (or use any() depending on logic)
-        # Here assuming 1D logic or "all dims must be < threshold"
+        raw = rng.normal(
+            loc=self.mean, scale=self.std,
+            size=(int(self.sample_num * self.buffer_multiplier), self.dim),
+        )
+        # Keep only events where every dimension is below threshold.
         mask = (raw < self.threshold).all(axis=1)
         filtered = raw[mask]
-
         if len(filtered) < self.sample_num:
             raise ValueError(
-                f"HighCut threshold is too strict. Generated {len(filtered)} valid samples, needed {self.sample_num}.")
-
+                f"HighCut threshold too strict: generated {len(filtered)} valid samples, "
+                f"needed {self.sample_num}. Increase `buffer_multiplier`."
+            )
         return filtered[:self.sample_num]
 
 
 @dataclass
 class MultiPeak(Synthetic):
-    # List of [mean, std, weight]
-    # Example: [[0.0, 1.0, 0.5], [5.0, 1.0, 0.5]] for two equal peaks at 0 and 5
+    """Mixture of Gaussians: each peak is ``[mean, std, weight]`` (weights re-normalised)."""
+
     peaks: list = MISSING
 
     def generate_data(self) -> np.ndarray:
         rng = np.random.default_rng(self.random_seed)
-
         means = [p[0] for p in self.peaks]
         stds = [p[1] for p in self.peaks]
-        weights = [p[2] for p in self.peaks]
-
-        # Normalize weights
-        weights = np.array(weights) / np.sum(weights)
-
-        # Determine how many samples per peak
+        weights = np.array([p[2] for p in self.peaks])
+        weights = weights / weights.sum()
         samples_per_peak = rng.multinomial(self.sample_num, weights)
 
-        data_parts = []
-        for count, mu, sigma in zip(samples_per_peak, means, stds):
-            if count > 0:
-                part = rng.normal(loc=mu, scale=sigma, size=(count, self.dim))
-                data_parts.append(part)
-
-        data = np.vstack(data_parts)
-        rng.shuffle(data)  # Shuffle so peaks aren't ordered
+        parts = [
+            rng.normal(loc=mu, scale=sigma, size=(count, self.dim))
+            for count, mu, sigma in zip(samples_per_peak, means, stds) if count > 0
+        ]
+        data = np.vstack(parts)
+        rng.shuffle(data)  # break per-peak ordering
         return data
 
 
 @dataclass
 class HighFrequency(Synthetic):
+    """Base Gaussian plus ``num_noise_peaks`` sharp Gaussian noise peaks.
+
+    ``noise_prob`` is the fraction of samples drawn from the noise peaks
+    (each itself a narrow Gaussian of width ``noise_std``); the rest come
+    from ``N(base_mean, base_std)``. Noise peak centres are drawn uniformly
+    from ``noise_range``.
     """
-    Base Gaussian with added high-frequency noise (sharp little peaks).
-    Implemented as a Mixture: Main Gaussian + Many narrow Gaussians.
-    """
+
     base_mean: float = MISSING
     base_std: float = MISSING
 
@@ -418,48 +457,40 @@ class HighFrequency(Synthetic):
     def generate_data(self) -> np.ndarray:
         rng = np.random.default_rng(self.random_seed)
 
-        # Main Base Data
         n_base = int(self.sample_num * (1 - self.noise_prob))
         base_data = rng.normal(
-            loc=self.base_mean, scale=self.base_std, size=(n_base, self.dim))
+            loc=self.base_mean, scale=self.base_std, size=(n_base, self.dim),
+        )
 
-        # Noise Data (Sharp peaks)
         n_noise = self.sample_num - n_base
-
-        # Randomly place the centers of the sharp peaks
         peak_centers = rng.uniform(
-            self.noise_range[0], self.noise_range[1], size=self.num_noise_peaks)
-
-        # Assign each noise sample to one of the sharp peaks
+            self.noise_range[0], self.noise_range[1], size=self.num_noise_peaks,
+        )
         peak_choices = rng.choice(peak_centers, size=n_noise)
-
-        # Generate the noise samples around their chosen centers
         noise_data = rng.normal(
-            loc=peak_choices.reshape(-1, 1), scale=self.noise_std, size=(n_noise, self.dim))
+            loc=peak_choices.reshape(-1, 1), scale=self.noise_std,
+            size=(n_noise, self.dim),
+        )
 
-        # Combine
         data = np.vstack([base_data, noise_data])
         rng.shuffle(data)
-
         return data
 
 
 @dataclass
 class DeltaFunction(Synthetic):
-    """
-    Delta function dataset: all values are constant (default 0).
-    Useful for testing model behavior with a degenerate distribution.
-    """
+    """Degenerate point-mass distribution: every sample equals ``center``."""
+
     center: float = MISSING
 
     def generate_data(self) -> np.ndarray:
-        # All samples are exactly at the center value
         return np.full((self.sample_num, self.dim), self.center, dtype=np.float32)
 
 
 @dataclass
 class Uniform(Synthetic):
-    """Uniform distribution on [low, high]. Flat, no peak structure."""
+    """Uniform distribution on ``[low, high]`` (flat, no peak structure)."""
+
     low: float = MISSING
     high: float = MISSING
 
@@ -470,9 +501,10 @@ class Uniform(Synthetic):
 
 @dataclass
 class Exponential(Synthetic):
-    """Shifted exponential distribution. Skewed and one-sided."""
-    scale: float = MISSING   # 1/lambda (mean of the un-shifted distribution)
-    loc: float = MISSING     # shift: samples are loc + Exp(scale)
+    """Shifted exponential distribution: ``loc + Exp(scale)`` (skewed, one-sided)."""
+
+    scale: float = MISSING   # 1/lambda — mean of the un-shifted exponential.
+    loc: float = MISSING     # additive shift.
 
     def generate_data(self) -> np.ndarray:
         rng = np.random.default_rng(self.random_seed)

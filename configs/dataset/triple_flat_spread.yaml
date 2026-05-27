@@ -1,7 +1,10 @@
+# Three broad Gaussians: two adjacent, one far away.
+
 defaults:
   - multipeak
 
-# (mean, std, weight)
-peaks: [[0.0, 1.0, 0.3], [3.4, 1.4, 0.3], [9.0, 1.7, 0.2]] 
-
-# three flat ones. two close, one far.
+# [mean, std, weight]
+peaks:
+  - [0.0, 1.0, 0.3]
+  - [3.4, 1.4, 0.3]
+  - [9.0, 1.7, 0.2]
